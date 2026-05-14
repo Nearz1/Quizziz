@@ -11,46 +11,43 @@
 (function() {
     'use strict';
 
-    // -----------------------------------------------------------------------------------
-    // IMPORTANTE: LISTA DE CHAVES DE API
-    // -----------------------------------------------------------------------------------
+    // :: provedor primário — chaves rotativas do Gemini
     const GEMINI_API_KEYS = [
-        "CHAVE_GEMINI_1",   // Chave 1
-        "CHAVE_GEMINI_2",  // Chave 2
-        "CHAVE_GEMINI_3"  // Chave 3
+        "CHAVE_GEMINI_1",
+        "CHAVE_GEMINI_2",
+        "CHAVE_GEMINI_3"
     ];
-    // --- Integração OpenRouter/DeepSeek (v47) ---
+
+    // :: provedor secundário — chaves rotativas do OpenRouter
     const OPENROUTER_API_KEYS = [
         "SUA_CHAVE_OPENROUTER_1",
         "SUA_CHAVE_OPENROUTER_2",
         "SUA_CHAVE_OPENROUTER_3"
     ];
-    const DEEPSEEK_MODEL_NAME = "deepseek/deepseek-chat"; // Modelo DeepSeek
-    let currentAiProvider = 'gemini'; // 'gemini' ou 'deepseek'
-    // -----------------------------------------------------------------------------------
 
-    let currentApiKeyIndex = 0;
-    let currentOpenRouterKeyIndex = 0;
-    let lastAiResponse = '';
+    const DEEPSEEK_MODEL_IDENTIFIER = "deepseek/deepseek-chat";
+    let activeAiProvider = 'gemini';
 
-    // --- DETECÇÃO DE QUIZ ID (v46) ---
-    const regexQuizId = /\/(?:quiz|quizzes|admin\/quiz|games|attempts|join)\/([a-f0-9]{24})/i;
-    let quizIdDetected = null;
-    let interceptorsStarted = false;
-    // -----------------------------------
+    let geminiKeyRotationIndex = 0;
+    let openRouterKeyRotationIndex = 0;
+    let rawAiResponseCache = '';
 
-    // --- FUNÇÕES UTILITÁRIAS ---
+    // :: padrão para capturar IDs de quiz nas URLs interceptadas
+    const QUIZ_ID_URL_PATTERN = /\/(?:quiz|quizzes|admin\/quiz|games|attempts|join)\/([a-f0-9]{24})/i;
+    let detectedQuizId = null;
+    let networkInterceptorsActive = false;
 
-    function waitForElement(selector, all = false, timeout = 5000) {
+
+    function waitForElement(selector, returnAll = false, timeout = 5000) {
         return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            const interval = setInterval(() => {
-                const elements = all ? document.querySelectorAll(selector) : document.querySelector(selector);
-                if ((all && elements.length > 0) || (!all && elements)) {
-                    clearInterval(interval);
-                    resolve(elements);
-                } else if (Date.now() - startTime > timeout) {
-                    clearInterval(interval);
+            const startTimestamp = Date.now();
+            const pollingInterval = setInterval(() => {
+                const result = returnAll ? document.querySelectorAll(selector) : document.querySelector(selector);
+                if ((returnAll && result.length > 0) || (!returnAll && result)) {
+                    clearInterval(pollingInterval);
+                    resolve(result);
+                } else if (Date.now() - startTimestamp > timeout) {
+                    clearInterval(pollingInterval);
                     reject(new Error(`Elemento(s) "${selector}" não encontrado(s) após ${timeout / 1000} segundos.`));
                 }
             }, 100);
@@ -59,673 +56,663 @@
 
     function waitForElementToDisappear(selector, timeout = 5000) {
         return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            const interval = setInterval(() => {
+            const startTimestamp = Date.now();
+            const pollingInterval = setInterval(() => {
                 const element = document.querySelector(selector);
                 if (!element) {
-                    clearInterval(interval);
+                    clearInterval(pollingInterval);
                     resolve();
-                } else if (Date.now() - startTime > timeout) {
-                    clearInterval(interval);
+                } else if (Date.now() - startTimestamp > timeout) {
+                    clearInterval(pollingInterval);
                     reject(new Error(`Elemento "${selector}" não desapareceu após ${timeout / 1000} segundos.`));
                 }
             }, 100);
         });
     }
 
-    // --- LÓGICA DO RESOLVEDOR ---
 
-    async function extrairDadosDaQuestao() {
+    async function extractQuestionPayload() {
         try {
-            const questionTextElement = document.querySelector('#questionText');
-            const questionText = questionTextElement ? questionTextElement.innerText.trim().replace(/\s+/g, ' ') : "Não foi possível encontrar o texto da pergunta.";
-            const questionImageElement = document.querySelector('img[data-testid="question-container-image"]');
-            const questionImageUrl = questionImageElement ? questionImageElement.src : null;
+            const questionTextNode = document.querySelector('#questionText');
+            const questionTextContent = questionTextNode ? questionTextNode.innerText.trim().replace(/\s+/g, ' ') : "Não foi possível encontrar o texto da pergunta.";
+            const questionImageNode = document.querySelector('img[data-testid="question-container-image"]');
+            const questionImageSrc = questionImageNode ? questionImageNode.src : null;
 
-            const extractText = (el) => {
-                const mathElement = el.querySelector('annotation[encoding="application/x-tex"]');
-                return mathElement ? mathElement.textContent.trim() : el.querySelector('#optionText')?.innerText.trim() || '';
+            const extractOptionText = (el) => {
+                const mathAnnotation = el.querySelector('annotation[encoding="application/x-tex"]');
+                return mathAnnotation ? mathAnnotation.textContent.trim() : el.querySelector('#optionText')?.innerText.trim() || '';
             };
 
-            const dropdownButtons = document.querySelectorAll('button.options-dropdown');
-            if (dropdownButtons.length > 1) {
+            const dropdownTriggers = document.querySelectorAll('button.options-dropdown');
+            if (dropdownTriggers.length > 1) {
                 console.log("Tipo Múltiplos Dropdowns detectado.");
-                const dropdowns = [];
-                let questionTextWithPlaceholders = questionTextElement.innerHTML;
-                const popperSelector = '.v-popper__popper--shown';
+                const dropdownEntries = [];
+                let questionMarkupWithPlaceholders = questionTextNode.innerHTML;
+                const activePopperSelector = '.v-popper__popper--shown';
 
-                dropdownButtons.forEach((btn, i) => {
-                    const placeholder = ` [RESPOSTA ${i + 1}] `;
-                    const wrapper = btn.closest('.dropdown-wrapper');
-                    if (wrapper) {
-                         questionTextWithPlaceholders = questionTextWithPlaceholders.replace(wrapper.outerHTML, placeholder);
+                dropdownTriggers.forEach((trigger, idx) => {
+                    const placeholder = ` [RESPOSTA ${idx + 1}] `;
+                    const wrapperNode = trigger.closest('.dropdown-wrapper');
+                    if (wrapperNode) {
+                        questionMarkupWithPlaceholders = questionMarkupWithPlaceholders.replace(wrapperNode.outerHTML, placeholder);
                     }
                 });
 
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = questionTextWithPlaceholders;
-                const cleanQuestionText = tempDiv.innerText.replace(/\s+/g, ' ');
+                const tempParserNode = document.createElement('div');
+                tempParserNode.innerHTML = questionMarkupWithPlaceholders;
+                const sanitizedQuestionText = tempParserNode.innerText.replace(/\s+/g, ' ');
 
-                let allAvailableOptions = [];
-                const firstBtn = dropdownButtons[0];
-                firstBtn.click();
+                let sharedOptionPool = [];
+                const firstTrigger = dropdownTriggers[0];
+                firstTrigger.click();
                 try {
-                    const optionElements = await waitForElement(`${popperSelector} button.dropdown-option`, true, 2000);
-                    allAvailableOptions = Array.from(optionElements).map(el => el.innerText.trim());
-                    console.log("Pool de opções detectado:", allAvailableOptions);
-                } catch (e) {
-                    console.error("Falha ao ler o pool de opções do primeiro dropdown.", e);
-                    if (document.querySelector(popperSelector)) document.body.click();
+                    const poolOptionNodes = await waitForElement(`${activePopperSelector} button.dropdown-option`, true, 2000);
+                    sharedOptionPool = Array.from(poolOptionNodes).map(el => el.innerText.trim());
+                    console.log("Pool de opções detectado:", sharedOptionPool);
+                } catch (poolError) {
+                    console.error("Falha ao ler o pool de opções do primeiro dropdown.", poolError);
+                    if (document.querySelector(activePopperSelector)) document.body.click();
                 }
 
-                if (document.querySelector(popperSelector)) document.body.click();
+                if (document.querySelector(activePopperSelector)) document.body.click();
                 try {
-                    await waitForElementToDisappear(popperSelector, 2000);
-                } catch (e) {
+                    await waitForElementToDisappear(activePopperSelector, 2000);
+                } catch (disappearError) {
                     console.warn("Popper não fechou, mas continuando...");
                 }
 
-                dropdownButtons.forEach((btn, i) => {
-                     dropdowns.push({
-                        button: btn,
-                        placeholder: `[RESPOSTA ${i + 1}]`
+                dropdownTriggers.forEach((trigger, idx) => {
+                    dropdownEntries.push({
+                        button: trigger,
+                        placeholder: `[RESPOSTA ${idx + 1}]`
                     });
                 });
 
-                console.log("Texto Limpo Enviado para IA:", cleanQuestionText);
-                return { questionText: cleanQuestionText, questionImageUrl, questionType: 'multi_dropdown', dropdowns, allAvailableOptions };
+                console.log("Texto Limpo Enviado para IA:", sanitizedQuestionText);
+                return { questionText: sanitizedQuestionText, questionImageUrl: questionImageSrc, questionType: 'multi_dropdown', dropdowns: dropdownEntries, allAvailableOptions: sharedOptionPool };
             }
 
-            if (dropdownButtons.length === 1) {
-                return { questionText, questionImageUrl, questionType: 'dropdown', dropdownButton: dropdownButtons[0] };
+            if (dropdownTriggers.length === 1) {
+                return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'dropdown', dropdownButton: dropdownTriggers[0] };
             }
 
-            const equationEditor = document.querySelector('div[data-cy="equation-editor"]');
-            if (equationEditor) {
-                return { questionText, questionImageUrl, questionType: 'equation' };
+            const equationEditorNode = document.querySelector('div[data-cy="equation-editor"]');
+            if (equationEditorNode) {
+                return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'equation' };
             }
 
-            // NOVA LÓGICA (v52.0): TIPO DRAG AND DROP SOBRE IMAGEM
-            const dragDropImageBlanks = document.querySelectorAll('.drag-and-drop-image-blank');
-            const dragDropImageOptions = document.querySelectorAll('.drag-option-dnd-image');
-            if (dragDropImageBlanks.length > 0 && dragDropImageOptions.length > 0) {
+            // :: detecção de drag-and-drop sobre imagem de fundo
+            const imageDropZoneNodes = document.querySelectorAll('.drag-and-drop-image-blank');
+            const imageDraggableNodes = document.querySelectorAll('.drag-option-dnd-image');
+            if (imageDropZoneNodes.length > 0 && imageDraggableNodes.length > 0) {
                 console.log("Tipo Drag and Drop over Image detectado.");
-                const mainImageEl = document.querySelector('.image-container img');
-                const mainImageUrl = mainImageEl ? mainImageEl.src : null;
+                const backgroundImageNode = document.querySelector('.image-container img');
+                const backgroundImageSrc = backgroundImageNode ? backgroundImageNode.src : null;
 
-                const draggableOptions = Array.from(dragDropImageOptions).map(el => ({
+                const draggableOptionSet = Array.from(imageDraggableNodes).map(el => ({
                     text: el.innerText.trim().replace(/\n/g, ' '),
                     element: el
                 }));
 
-                const dropZonesData = Array.from(dragDropImageBlanks).map(el => {
-                    const rect = el.getBoundingClientRect();
-                    return { element: el, top: rect.top, left: rect.left };
+                const rawDropZones = Array.from(imageDropZoneNodes).map(el => {
+                    const boundingRect = el.getBoundingClientRect();
+                    return { element: el, top: boundingRect.top, left: boundingRect.left };
                 });
 
-                // Ordena os blanks de cima para baixo, e se estiverem na mesma linha, da esquerda para a direita
-                dropZonesData.sort((a, b) => {
-                    if (Math.abs(a.top - b.top) > 20) { // Tolerância de 20px para a mesma "linha"
+                rawDropZones.sort((a, b) => {
+                    if (Math.abs(a.top - b.top) > 20) {
                         return a.top - b.top;
                     }
                     return a.left - b.left;
                 });
 
-                const dropZones = dropZonesData.map((data, index) => ({
-                    id: `ESPAÇO ${index + 1}`,
-                    element: data.element
+                const sortedDropZones = rawDropZones.map((entry, idx) => ({
+                    id: `ESPAÇO ${idx + 1}`,
+                    element: entry.element
                 }));
 
-                return { questionText, questionImageUrl: mainImageUrl, questionType: 'drag_and_drop_image', draggableOptions, dropZones };
+                return { questionText: questionTextContent, questionImageUrl: backgroundImageSrc, questionType: 'drag_and_drop_image', draggableOptions: draggableOptionSet, dropZones: sortedDropZones };
             }
 
-            const droppableBlanks = document.querySelectorAll('button.droppable-blank');
-            const dragOptions = document.querySelectorAll('.drag-option');
-            if (droppableBlanks.length > 1 && dragOptions.length > 0) {
-                const questionContainer = document.querySelector('.drag-drop-text > div');
-                const dropZones = [];
-                if (questionContainer) {
-                    const children = Array.from(questionContainer.children);
-                    for (let i = 0; i < children.length; i++) {
-                        const blankButton = children[i].querySelector('button.droppable-blank');
-                        if (blankButton) {
-                            const precedingSpan = children[i - 1];
-                            if (precedingSpan && precedingSpan.tagName === 'SPAN') {
-                                let promptText = precedingSpan.innerText.trim().replace(/:\s*$/, '').replace(/\s+/g, ' ');
-                                dropZones.push({ prompt: promptText, blankElement: blankButton });
+            const blankDropTargets = document.querySelectorAll('button.droppable-blank');
+            const draggablePills = document.querySelectorAll('.drag-option');
+            if (blankDropTargets.length > 1 && draggablePills.length > 0) {
+                const dragDropContainer = document.querySelector('.drag-drop-text > div');
+                const resolvedDropZones = [];
+                if (dragDropContainer) {
+                    const containerChildren = Array.from(dragDropContainer.children);
+                    for (let i = 0; i < containerChildren.length; i++) {
+                        const blankTrigger = containerChildren[i].querySelector('button.droppable-blank');
+                        if (blankTrigger) {
+                            const precedingNode = containerChildren[i - 1];
+                            if (precedingNode && precedingNode.tagName === 'SPAN') {
+                                let extractedPrompt = precedingNode.innerText.trim().replace(/:\s*$/, '').replace(/\s+/g, ' ');
+                                resolvedDropZones.push({ prompt: extractedPrompt, blankElement: blankTrigger });
                             }
                         }
                     }
                 }
-                const draggableOptions = Array.from(dragOptions).map(el => ({ text: el.innerText.trim(), element: el }));
-                return { questionText: questionContainer.innerText.trim(), questionImageUrl, questionType: 'multi_drag_into_blank', draggableOptions, dropZones };
+                const draggableLabelSet = Array.from(draggablePills).map(el => ({ text: el.innerText.trim(), element: el }));
+                return { questionText: dragDropContainer.innerText.trim(), questionImageUrl: questionImageSrc, questionType: 'multi_drag_into_blank', draggableOptions: draggableLabelSet, dropZones: resolvedDropZones };
             }
-            if (droppableBlanks.length === 1 && dragOptions.length > 0) {
-                 const draggableOptions = Array.from(dragOptions).map(el => ({ text: el.querySelector('.dnd-option-text')?.innerText.trim() || '', element: el }));
-                return { questionText, questionImageUrl, questionType: 'drag_into_blank', draggableOptions, dropZone: { element: droppableBlanks[0] } };
+            if (blankDropTargets.length === 1 && draggablePills.length > 0) {
+                const draggableLabelSet = Array.from(draggablePills).map(el => ({ text: el.querySelector('.dnd-option-text')?.innerText.trim() || '', element: el }));
+                return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'drag_into_blank', draggableOptions: draggableLabelSet, dropZone: { element: blankDropTargets[0] } };
             }
 
-            // TIPO CATEGORIZE (v51.0)
-            const classificationContainer = document.querySelector('.classification-question, .classification-layout-evaluation-completed, .classification-layout');
-            if (classificationContainer) {
+            // :: classificação por categorias
+            const categorizationContainer = document.querySelector('.classification-question, .classification-layout-evaluation-completed, .classification-layout');
+            if (categorizationContainer) {
                 console.log("Tipo Categorize detectado.");
 
-                const categoryElements = document.querySelectorAll('.list-group');
-                const categories = Array.from(categoryElements).map(el => {
-                    const titleSpan = el.querySelector('.bg-gradient-to-b span, span');
+                const categoryGroupNodes = document.querySelectorAll('.list-group');
+                const categoryEntries = Array.from(categoryGroupNodes).map(el => {
+                    const titleNode = el.querySelector('.bg-gradient-to-b span, span');
                     return {
-                        name: titleSpan ? titleSpan.innerText.trim() : 'Categoria',
+                        name: titleNode ? titleNode.innerText.trim() : 'Categoria',
                         element: el
                     };
                 });
 
-                const draggables = [];
-                const seenTexts = new Set();
+                const draggableItemSet = [];
+                const seenLabelSet = new Set();
+                const grabbableNodes = document.querySelectorAll('.cursor-grab, .classification-option-text-container');
 
-                const draggableElements = document.querySelectorAll('.cursor-grab, .classification-option-text-container');
-
-                draggableElements.forEach(el => {
+                grabbableNodes.forEach(el => {
                     const parentCard = el.closest('.cursor-grab') || el.closest('[id]') || el;
-                    const text = el.innerText.trim().replace(/\n/g, ' ');
-                    if(text && !seenTexts.has(text)) {
-                        seenTexts.add(text);
-                        draggables.push({ text, element: parentCard });
+                    const labelText = el.innerText.trim().replace(/\n/g, ' ');
+                    if (labelText && !seenLabelSet.has(labelText)) {
+                        seenLabelSet.add(labelText);
+                        draggableItemSet.push({ text: labelText, element: parentCard });
                     }
                 });
 
-                if (categories.length > 0 && draggables.length > 0) {
-                    return { questionText, questionImageUrl, questionType: 'categorize', categories, draggables };
+                if (categoryEntries.length > 0 && draggableItemSet.length > 0) {
+                    return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'categorize', categories: categoryEntries, draggables: draggableItemSet };
                 }
             }
 
-            const matchContainer = document.querySelector('.match-order-options-container, .question-options-layout');
-            if (matchContainer) {
-                const draggableItemElements = Array.from(matchContainer.querySelectorAll('.match-order-option.is-option-tile'));
-                const dropZoneElements = Array.from(matchContainer.querySelectorAll('.match-order-option.is-drop-tile'));
+            const matchLayoutContainer = document.querySelector('.match-order-options-container, .question-options-layout');
+            if (matchLayoutContainer) {
+                const draggableTileNodes = Array.from(matchLayoutContainer.querySelectorAll('.match-order-option.is-option-tile'));
+                const dropTargetTileNodes = Array.from(matchLayoutContainer.querySelectorAll('.match-order-option.is-drop-tile'));
 
-                const isImageMatch = draggableItemElements.length > 0 && (draggableItemElements[0].querySelector('.option-image') || draggableItemElements[0].dataset.type === 'image');
+                const hasImageTiles = draggableTileNodes.length > 0 && (draggableTileNodes[0].querySelector('.option-image') || draggableTileNodes[0].dataset.type === 'image');
 
-                if (isImageMatch) {
+                if (hasImageTiles) {
                     console.log("Tipo Match-Order (Imagem p/ Texto) detectado.");
-                    const draggableItems = [];
-                    for (let i = 0; i < draggableItemElements.length; i++) {
-                        const el = draggableItemElements[i];
-                        const imgDiv = el.querySelector('.option-image');
-                        const style = imgDiv ? window.getComputedStyle(imgDiv).backgroundImage : null;
-                        const urlMatch = style ? style.match(/url\("(.+?)"\)/) : null;
-                        let imageUrl = urlMatch ? urlMatch[1] : null;
+                    const imageItemSet = [];
+                    for (let i = 0; i < draggableTileNodes.length; i++) {
+                        const tileNode = draggableTileNodes[i];
+                        const imageDiv = tileNode.querySelector('.option-image');
+                        const computedStyle = imageDiv ? window.getComputedStyle(imageDiv).backgroundImage : null;
+                        const urlCapture = computedStyle ? computedStyle.match(/url\("(.+?)"\)/) : null;
+                        let resolvedImageUrl = urlCapture ? urlCapture[1] : null;
 
-                        if (!imageUrl) {
-                            const dataCy = el.dataset.cy;
-                            if (dataCy && dataCy.includes('url(')) {
-                                const urlMatchCy = dataCy.match(/url\((.+)\)/);
-                                if (urlMatchCy) imageUrl = urlMatchCy[1].replace(/\?w=\d+&h=\d+$/, '');
+                        if (!resolvedImageUrl) {
+                            const dataCyAttr = tileNode.dataset.cy;
+                            if (dataCyAttr && dataCyAttr.includes('url(')) {
+                                const fallbackCapture = dataCyAttr.match(/url\((.+)\)/);
+                                if (fallbackCapture) resolvedImageUrl = fallbackCapture[1].replace(/\?w=\d+&h=\d+$/, '');
                             }
                         }
 
-                        if (imageUrl) {
-                            draggableItems.push({ id: `IMAGEM ${i + 1}`, imageUrl, element: el });
+                        if (resolvedImageUrl) {
+                            imageItemSet.push({ id: `IMAGEM ${i + 1}`, imageUrl: resolvedImageUrl, element: tileNode });
                         }
                     }
 
-                    const dropZones = dropZoneElements.map(el => ({ text: extractText(el), element: el }));
+                    const textTargetSet = dropTargetTileNodes.map(el => ({ text: extractOptionText(el), element: el }));
+                    return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'match_image_to_text', draggableItems: imageItemSet, dropZones: textTargetSet };
 
-                    return { questionText, questionImageUrl, questionType: 'match_image_to_text', draggableItems, dropZones };
+                } else if (draggableTileNodes.length > 0 && dropTargetTileNodes.length > 0) {
+                    const labelItemSet = draggableTileNodes.map(el => ({ text: extractOptionText(el), element: el }));
+                    const targetItemSet = dropTargetTileNodes.map(el => ({ text: extractOptionText(el), element: el }));
 
-                } else if (draggableItemElements.length > 0 && dropZoneElements.length > 0) {
-                    const draggableItems = draggableItemElements.map(el => ({ text: extractText(el), element: el }));
-                    const dropZones = dropZoneElements.map(el => ({ text: extractText(el), element: el }));
-
-                    const questionType = questionText.toLowerCase().includes('reorder') ? 'reorder' : 'match_order';
-                    return { questionText, questionImageUrl, questionType, draggableItems, dropZones };
+                    const resolvedType = questionTextContent.toLowerCase().includes('reorder') ? 'reorder' : 'match_order';
+                    return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: resolvedType, draggableItems: labelItemSet, dropZones: targetItemSet };
                 }
             }
 
-            const openEndedTextarea = document.querySelector('textarea[data-cy="open-ended-textarea"]');
-            if (openEndedTextarea) {
-                return { questionText, questionImageUrl, questionType: 'open_ended', answerElement: openEndedTextarea };
+            const openEndedInputNode = document.querySelector('textarea[data-cy="open-ended-textarea"]');
+            if (openEndedInputNode) {
+                return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: 'open_ended', answerElement: openEndedInputNode };
             }
-            const optionElements = document.querySelectorAll('.option.is-selectable');
-            if (optionElements.length > 0) {
-                const isMultipleChoice = Array.from(optionElements).some(el => el.classList.contains('is-msq'));
-                const options = Array.from(optionElements).map(el => ({ text: extractText(el), element: el }));
-                return { questionText, questionImageUrl, questionType: isMultipleChoice ? 'multiple_choice' : 'single_choice', options };
+
+            const selectableOptionNodes = document.querySelectorAll('.option.is-selectable');
+            if (selectableOptionNodes.length > 0) {
+                const isMultiSelect = Array.from(selectableOptionNodes).some(el => el.classList.contains('is-msq'));
+                const parsedOptions = Array.from(selectableOptionNodes).map(el => ({ text: extractOptionText(el), element: el }));
+                return { questionText: questionTextContent, questionImageUrl: questionImageSrc, questionType: isMultiSelect ? 'multiple_choice' : 'single_choice', options: parsedOptions };
             }
+
             console.error("Tipo de questão não reconhecido.");
             return null;
-        } catch (error) {
-            console.error("Erro ao extrair dados da questão:", error);
+        } catch (extractionError) {
+            console.error("Erro ao extrair dados da questão:", extractionError);
             return null;
         }
     }
 
-    async function obterRespostaDaIA(quizData) {
-        lastAiResponse = '';
-        const viewResponseBtn = document.getElementById('view-raw-response-btn');
-        if (viewResponseBtn) viewResponseBtn.style.display = 'none';
+    async function fetchAiSolution(questionPayload) {
+        rawAiResponseCache = '';
+        const rawResponseToggleBtn = document.getElementById('view-raw-response-btn');
+        if (rawResponseToggleBtn) rawResponseToggleBtn.style.display = 'none';
 
-        // --- 1. Lógica de Prompt ---
-        let promptDeInstrucao = "", formattedOptions = "";
-        switch (quizData.questionType) {
+        let instructionPrompt = "", formattedOptionsBlock = "";
+        switch (questionPayload.questionType) {
             case 'drag_and_drop_image':
-                promptDeInstrucao = `Esta é uma questão de arrastar rótulos para áreas específicas de uma imagem. As áreas vazias (ESPAÇOS) na imagem foram ordenadas da sua visão de cima para baixo e da esquerda para a direita. Relacione cada espaço visual com o rótulo correto baseado na anatomia/assunto. Responda no formato EXATO: 'ESPAÇO X -> Nome do Rótulo', com cada par em uma nova linha.`;
-                const draggablesImgOptions = quizData.draggableOptions.map(item => `- "${item.text}"`).join('\n');
-                const dropZonesList = quizData.dropZones.map(item => `- "${item.id}"`).join('\n');
-                formattedOptions = `Rótulos Disponíveis:\n${draggablesImgOptions}\n\nEspaços na Imagem:\n${dropZonesList}`;
+                instructionPrompt = `Esta é uma questão de arrastar rótulos para áreas específicas de uma imagem. As áreas vazias (ESPAÇOS) na imagem foram ordenadas da sua visão de cima para baixo e da esquerda para a direita. Relacione cada espaço visual com o rótulo correto baseado na anatomia/assunto. Responda no formato EXATO: 'ESPAÇO X -> Nome do Rótulo', com cada par em uma nova linha.`;
+                const dndImageLabels = questionPayload.draggableOptions.map(item => `- "${item.text}"`).join('\n');
+                const dndImageZones = questionPayload.dropZones.map(item => `- "${item.id}"`).join('\n');
+                formattedOptionsBlock = `Rótulos Disponíveis:\n${dndImageLabels}\n\nEspaços na Imagem:\n${dndImageZones}`;
                 break;
             case 'categorize':
-                promptDeInstrucao = `Esta é uma questão de categorização. Para cada item listado, forneça a categoria correta no formato EXATO: 'Texto do Item -> Nome da Categoria', com cada par em uma nova linha.`;
-                const catNames = quizData.categories.map(c => `- "${c.name}"`).join('\n');
-                const itemNames = quizData.draggables.map(i => `- "${i.text}"`).join('\n');
-                formattedOptions = `Categorias Disponíveis:\n${catNames}\n\nItens para Categorizar:\n${itemNames}`;
+                instructionPrompt = `Esta é uma questão de categorização. Para cada item listado, forneça a categoria correta no formato EXATO: 'Texto do Item -> Nome da Categoria', com cada par em uma nova linha.`;
+                const categoryNameList = questionPayload.categories.map(c => `- "${c.name}"`).join('\n');
+                const draggableItemList = questionPayload.draggables.map(i => `- "${i.text}"`).join('\n');
+                formattedOptionsBlock = `Categorias Disponíveis:\n${categoryNameList}\n\nItens para Categorizar:\n${draggableItemList}`;
                 break;
             case 'multi_dropdown':
-                promptDeInstrucao = `Esta é uma questão com múltiplas lacunas ([RESPOSTA X]). As opções disponíveis são um pool compartilhado e cada opção só pode ser usada uma vez. Determine a resposta correta para CADA placeholder. Responda com cada resposta em uma nova linha, no formato '[RESPOSTA X]: Resposta Correta'. Se algum placeholder não tiver uma resposta lógica no pool (ex: está fora da sequência), omita-o da resposta.`;
-                formattedOptions = "Pool de Opções Disponíveis: " + quizData.allAvailableOptions.join(', ');
+                instructionPrompt = `Esta é uma questão com múltiplas lacunas ([RESPOSTA X]). As opções disponíveis são um pool compartilhado e cada opção só pode ser usada uma vez. Determine a resposta correta para CADA placeholder. Responda com cada resposta em uma nova linha, no formato '[RESPOSTA X]: Resposta Correta'. Se algum placeholder não tiver uma resposta lógica no pool (ex: está fora da sequência), omita-o da resposta.`;
+                formattedOptionsBlock = "Pool de Opções Disponíveis: " + questionPayload.allAvailableOptions.join(', ');
                 break;
             case 'match_image_to_text':
-                promptDeInstrucao = `Esta é uma questão de combinar imagens com seus textos correspondentes. Para cada imagem, forneça o par correto no formato EXATO: 'Texto da Opção -> ID da Imagem' (ex: 90° -> IMAGEM 3), com cada par em uma nova linha.`;
-                const dropZoneTexts = quizData.dropZones.map(item => `- "${item.text}"`).join('\n');
-                formattedOptions = `Opções de Texto (Locais para Soltar):\n${dropZoneTexts}`;
+                instructionPrompt = `Esta é uma questão de combinar imagens com seus textos correspondentes. Para cada imagem, forneça o par correto no formato EXATO: 'Texto da Opção -> ID da Imagem' (ex: 90° -> IMAGEM 3), com cada par em uma nova linha.`;
+                const textTargetList = questionPayload.dropZones.map(item => `- "${item.text}"`).join('\n');
+                formattedOptionsBlock = `Opções de Texto (Locais para Soltar):\n${textTargetList}`;
                 break;
             case 'match_order':
-                promptDeInstrucao = `Responda com os pares no formato EXATO: 'Texto do Local para Soltar -> Texto do Item para Arrastar', com cada par em uma nova linha.`;
-                const draggables = quizData.draggableItems.map(item => `- "${item.text}"`).join('\n');
-                const droppables = quizData.dropZones.map(item => `- "${item.text}"`).join('\n');
-                formattedOptions = `Itens para Arrastar:\n${draggables}\n\nLocais para Soltar:\n${droppables}`;
+                instructionPrompt = `Responda com os pares no formato EXATO: 'Texto do Local para Soltar -> Texto do Item para Arrastar', com cada par em uma nova linha.`;
+                const matchDraggables = questionPayload.draggableItems.map(item => `- "${item.text}"`).join('\n');
+                const matchDropZones = questionPayload.dropZones.map(item => `- "${item.text}"`).join('\n');
+                formattedOptionsBlock = `Itens para Arrastar:\n${matchDraggables}\n\nLocais para Soltar:\n${matchDropZones}`;
                 break;
-            case 'multi_drag_into_blank': promptDeInstrucao = `Esta é uma questão de combinar múltiplas sentenças com suas expressões corretas. Responda com os pares no formato EXATO: 'Sentença da pergunta -> Expressão da opção', com cada par em uma nova linha.`; const prompts = quizData.dropZones.map(item => `- "${item.prompt}"`).join('\n'); const options = quizData.draggableOptions.map(item => `- "${item.text}"`).join('\n'); formattedOptions = `Sentenças:\n${prompts}\n\nExpressões (Opções):\n${options}`; break;
-            case 'equation': promptDeInstrucao = `Resolva a seguinte equação ou inequação. Forneça apenas a expressão final simplificada (ex: x = 5, ou y > 3).`; formattedOptions = `EQUAÇÃO: "${quizData.questionText}"`; break;
-            case 'dropdown': case 'single_choice': promptDeInstrucao = `Responda APENAS com o texto exato da ÚNICA alternativa correta.`; formattedOptions = "OPÇÕES:\n" + quizData.options.map(opt => `- "${opt.text}"`).join('\n'); break;
-            case 'reorder': promptDeInstrucao = `A tarefa é: "${quizData.questionText}". Forneça a ordem correta listando os textos dos itens, um por linha, do primeiro ao último.`; formattedOptions = "Itens para ordenar:\n" + quizData.draggableItems.map(item => `- "${item.text}"`).join('\n'); break;
-            case 'drag_into_blank': promptDeInstrucao = `Responda APENAS com o texto da ÚNICA opção correta que preenche a lacuna.`; formattedOptions = "Opções para arrastar:\n" + quizData.draggableOptions.map(item => `- "${item.text}"`).join('\n'); break;
-            case 'open_ended': promptDeInstrucao = `Responda APENAS com a palavra ou frase curta que preenche a lacuna.`; break;
-            case 'multiple_choice': promptDeInstrucao = `Responda APENAS com os textos exatos de TODAS as alternativas corretas, separando cada uma em uma NOVA LINHA.`; formattedOptions = "OPÇÕES:\n" + quizData.options.map(opt => `- "${opt.text}"`).join('\n'); break;
+            case 'multi_drag_into_blank': instructionPrompt = `Esta é uma questão de combinar múltiplas sentenças com suas expressões corretas. Responda com os pares no formato EXATO: 'Sentença da pergunta -> Expressão da opção', com cada par em uma nova linha.`; const sentenceList = questionPayload.dropZones.map(item => `- "${item.prompt}"`).join('\n'); const expressionList = questionPayload.draggableOptions.map(item => `- "${item.text}"`).join('\n'); formattedOptionsBlock = `Sentenças:\n${sentenceList}\n\nExpressões (Opções):\n${expressionList}`; break;
+            case 'equation': instructionPrompt = `Resolva a seguinte equação ou inequação. Forneça apenas a expressão final simplificada (ex: x = 5, ou y > 3).`; formattedOptionsBlock = `EQUAÇÃO: "${questionPayload.questionText}"`; break;
+            case 'dropdown': case 'single_choice': instructionPrompt = `Responda APENAS com o texto exato da ÚNICA alternativa correta.`; formattedOptionsBlock = "OPÇÕES:\n" + questionPayload.options.map(opt => `- "${opt.text}"`).join('\n'); break;
+            case 'reorder': instructionPrompt = `A tarefa é: "${questionPayload.questionText}". Forneça a ordem correta listando os textos dos itens, um por linha, do primeiro ao último.`; formattedOptionsBlock = "Itens para ordenar:\n" + questionPayload.draggableItems.map(item => `- "${item.text}"`).join('\n'); break;
+            case 'drag_into_blank': instructionPrompt = `Responda APENAS com o texto da ÚNICA opção correta que preenche a lacuna.`; formattedOptionsBlock = "Opções para arrastar:\n" + questionPayload.draggableOptions.map(item => `- "${item.text}"`).join('\n'); break;
+            case 'open_ended': instructionPrompt = `Responda APENAS com a palavra ou frase curta que preenche a lacuna.`; break;
+            case 'multiple_choice': instructionPrompt = `Responda APENAS com os textos exatos de TODAS as alternativas corretas, separando cada uma em uma NOVA LINHA.`; formattedOptionsBlock = "OPÇÕES:\n" + questionPayload.options.map(opt => `- "${opt.text}"`).join('\n'); break;
         }
-        let textPrompt = `${promptDeInstrucao}\n\n---\nPERGUNTA: "${quizData.questionText}"\n---\n${formattedOptions}`;
+        let composedTextPrompt = `${instructionPrompt}\n\n---\nPERGUNTA: "${questionPayload.questionText}"\n---\n${formattedOptionsBlock}`;
 
-        // --- 2. Processamento de Imagem ---
-        let base64Image = null;
-        if (quizData.questionImageUrl) {
-            base64Image = await imageUrlToBase64(quizData.questionImageUrl);
+        let encodedQuestionImage = null;
+        if (questionPayload.questionImageUrl) {
+            encodedQuestionImage = await imageUrlToBase64(questionPayload.questionImageUrl);
         }
-        const hasDraggableImages = quizData.questionType === 'match_image_to_text';
+        const hasImageDraggables = questionPayload.questionType === 'match_image_to_text';
 
-        // Verificação de Imagem do DeepSeek
-        if (currentAiProvider === 'deepseek' && (base64Image || hasDraggableImages)) {
+        if (activeAiProvider === 'deepseek' && (encodedQuestionImage || hasImageDraggables)) {
             console.warn("DeepSeek ativo: ignorando imagem(ns) automaticamente.");
-            base64Image = null;
-            if (quizData.questionType === 'match_image_to_text') {
-                quizData.questionType = 'match_order';
-                quizData.draggableItems = quizData.draggableItems.map(item => ({
+            encodedQuestionImage = null;
+            if (questionPayload.questionType === 'match_image_to_text') {
+                questionPayload.questionType = 'match_order';
+                questionPayload.draggableItems = questionPayload.draggableItems.map(item => ({
                     text: item.id,
                     element: item.element
                 }));
-                promptDeInstrucao = `Responda com os pares no formato EXATO: 'Texto do Local para Soltar -> ID da Imagem' (ex: 90° -> IMAGEM 3), com cada par em uma nova linha.`;
-                const draggables = quizData.draggableItems.map(item => `- "${item.text}"`).join('\n');
-                const droppables = quizData.dropZones.map(item => `- "${item.text}"`).join('\n');
-                formattedOptions = `Itens para Arrastar (IDs):\n${draggables}\n\nLocais para Soltar:\n${droppables}`;
-                textPrompt = `${promptDeInstrucao}\n\n---\nPERGUNTA: "${quizData.questionText}"\n---\n${formattedOptions}`;
+                instructionPrompt = `Responda com os pares no formato EXATO: 'Texto do Local para Soltar -> ID da Imagem' (ex: 90° -> IMAGEM 3), com cada par em uma nova linha.`;
+                const fallbackDraggables = questionPayload.draggableItems.map(item => `- "${item.text}"`).join('\n');
+                const fallbackDropZones = questionPayload.dropZones.map(item => `- "${item.text}"`).join('\n');
+                formattedOptionsBlock = `Itens para Arrastar (IDs):\n${fallbackDraggables}\n\nLocais para Soltar:\n${fallbackDropZones}`;
+                composedTextPrompt = `${instructionPrompt}\n\n---\nPERGUNTA: "${questionPayload.questionText}"\n---\n${formattedOptionsBlock}`;
             }
         }
 
-        // --- 3. Lógica de Fetch ---
         try {
-            let aiResponseText = null;
-            if (currentAiProvider === 'gemini') {
+            let resolvedAiResponse = null;
+            if (activeAiProvider === 'gemini') {
                 console.log("Usando Provedor: Gemini");
-                let geminiKeyFailed = false;
-                for (let i = 0; i < GEMINI_API_KEYS.length; i++) {
-                    const currentKey = GEMINI_API_KEYS[currentApiKeyIndex];
-                    if (!currentKey || currentKey.includes("SUA_") || currentKey.length < 30) {
-                        console.warn(`Chave de API Gemini #${currentApiKeyIndex + 1} parece ser um placeholder. Pulando...`);
-                        currentApiKeyIndex = (currentApiKeyIndex + 1) % GEMINI_API_KEYS.length;
+                let allGeminiKeysFailed = false;
+                for (let attemptIndex = 0; attemptIndex < GEMINI_API_KEYS.length; attemptIndex++) {
+                    const activeKey = GEMINI_API_KEYS[geminiKeyRotationIndex];
+                    if (!activeKey || activeKey.includes("SUA_") || activeKey.length < 30) {
+                        console.warn(`Chave de API Gemini #${geminiKeyRotationIndex + 1} parece ser um placeholder. Pulando...`);
+                        geminiKeyRotationIndex = (geminiKeyRotationIndex + 1) % GEMINI_API_KEYS.length;
                         continue;
                     }
-                    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${currentKey}`;
+                    const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${activeKey}`;
 
-                    let promptParts = [{ text: textPrompt }];
+                    let promptPartList = [{ text: composedTextPrompt }];
 
-                    if (base64Image) {
-                        const [header, data] = base64Image.split(',');
-                        let mimeType = header.match(/:(.*?);/)[1];
-                        if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) mimeType = 'image/jpeg';
-                        promptParts.push({ inline_data: { mime_type: mimeType, data: data } });
+                    if (encodedQuestionImage) {
+                        const [imageHeader, imageData] = encodedQuestionImage.split(',');
+                        let imageMimeType = imageHeader.match(/:(.*?);/)[1];
+                        if (!['image/jpeg', 'image/png', 'image/webp'].includes(imageMimeType)) imageMimeType = 'image/jpeg';
+                        promptPartList.push({ inline_data: { mime_type: imageMimeType, data: imageData } });
                     }
 
-                    if (quizData.questionType === 'match_image_to_text') {
-                        promptParts.push({ text: "\n\nIMAGENS (Itens para Arrastar):\n" });
-                        for (const item of quizData.draggableItems) {
-                             const base64 = await imageUrlToBase64(item.imageUrl);
-                             if (base64) {
-                                const [header, data] = base64.split(',');
-                                let mimeType = header.match(/:(.*?);/)[1];
-                                if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) mimeType = 'image/jpeg';
-                                promptParts.push({ inline_data: { mime_type: mimeType, data: data } });
-                                promptParts.push({ text: `- ${item.id}` }); // Envia " - IMAGEM 1"
-                             }
+                    if (questionPayload.questionType === 'match_image_to_text') {
+                        promptPartList.push({ text: "\n\nIMAGENS (Itens para Arrastar):\n" });
+                        for (const imageItem of questionPayload.draggableItems) {
+                            const encodedItem = await imageUrlToBase64(imageItem.imageUrl);
+                            if (encodedItem) {
+                                const [itemHeader, itemData] = encodedItem.split(',');
+                                let itemMimeType = itemHeader.match(/:(.*?);/)[1];
+                                if (!['image/jpeg', 'image/png', 'image/webp'].includes(itemMimeType)) itemMimeType = 'image/jpeg';
+                                promptPartList.push({ inline_data: { mime_type: itemMimeType, data: itemData } });
+                                promptPartList.push({ text: `- ${imageItem.id}` });
+                            }
                         }
                     }
 
                     try {
-                        const response = await fetchWithTimeout(API_URL, {
+                        const apiResponse = await fetchWithTimeout(GEMINI_ENDPOINT, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ contents: [{ parts: promptParts }] })
+                            body: JSON.stringify({ contents: [{ parts: promptPartList }] })
                         });
-                        if (response.ok) {
-                            const data = await response.json();
-                            aiResponseText = data.candidates[0].content.parts[0].text;
-                            console.log(`Sucesso com a Chave API Gemini #${currentApiKeyIndex + 1}.`);
+                        if (apiResponse.ok) {
+                            const responseBody = await apiResponse.json();
+                            resolvedAiResponse = responseBody.candidates[0].content.parts[0].text;
+                            console.log(`Sucesso com a Chave API Gemini #${geminiKeyRotationIndex + 1}.`);
                             break;
                         }
-                        const errorData = await response.json();
-                        const errorMessage = errorData.error?.message || `Erro ${response.status}`;
-                        console.warn(`Chave API Gemini #${currentApiKeyIndex + 1} falhou: ${errorMessage}. Tentando a próxima...`);
-                        lastAiResponse = `Falha na Chave Gemini #${currentApiKeyIndex + 1}: ${errorMessage}`;
-                    } catch (error) {
-                        console.warn(`Erro na requisição com a Chave API Gemini #${currentApiKeyIndex + 1}: ${error.message}. Tentando a próxima...`);
-                        lastAiResponse = `Falha na Chave Gemini #${currentApiKeyIndex + 1}: ${error.message}`;
+                        const errorBody = await apiResponse.json();
+                        const errorDetail = errorBody.error?.message || `Erro ${apiResponse.status}`;
+                        console.warn(`Chave API Gemini #${geminiKeyRotationIndex + 1} falhou: ${errorDetail}. Tentando a próxima...`);
+                        rawAiResponseCache = `Falha na Chave Gemini #${geminiKeyRotationIndex + 1}: ${errorDetail}`;
+                    } catch (requestError) {
+                        console.warn(`Erro na requisição com a Chave API Gemini #${geminiKeyRotationIndex + 1}: ${requestError.message}. Tentando a próxima...`);
+                        rawAiResponseCache = `Falha na Chave Gemini #${geminiKeyRotationIndex + 1}: ${requestError.message}`;
                     }
-                    currentApiKeyIndex = (currentApiKeyIndex + 1) % GEMINI_API_KEYS.length;
-                    if (i === GEMINI_API_KEYS.length - 1) {
-                         geminiKeyFailed = true;
+                    geminiKeyRotationIndex = (geminiKeyRotationIndex + 1) % GEMINI_API_KEYS.length;
+                    if (attemptIndex === GEMINI_API_KEYS.length - 1) {
+                        allGeminiKeysFailed = true;
                     }
                 }
-                if (!aiResponseText && geminiKeyFailed) {
+                if (!resolvedAiResponse && allGeminiKeysFailed) {
                     throw new Error("Todas as chaves de API do Gemini falharam.");
                 }
 
-            } else if (currentAiProvider === 'deepseek') {
+            } else if (activeAiProvider === 'deepseek') {
                 console.log("Usando Provedor: DeepSeek (via OpenRouter)");
-                let deepseekKeyFailed = false;
+                let allOpenRouterKeysFailed = false;
 
-                for (let i = 0; i < OPENROUTER_API_KEYS.length; i++) {
-                    const currentKey = OPENROUTER_API_KEYS[currentOpenRouterKeyIndex];
-                    if (!currentKey || currentKey.includes("SUA_") || currentKey.length < 30) {
-                        console.warn(`Chave OpenRouter #${currentOpenRouterKeyIndex + 1} parece ser um placeholder. Pulando...`);
-                        currentOpenRouterKeyIndex = (currentOpenRouterKeyIndex + 1) % OPENROUTER_API_KEYS.length;
+                for (let attemptIndex = 0; attemptIndex < OPENROUTER_API_KEYS.length; attemptIndex++) {
+                    const activeKey = OPENROUTER_API_KEYS[openRouterKeyRotationIndex];
+                    if (!activeKey || activeKey.includes("SUA_") || activeKey.length < 30) {
+                        console.warn(`Chave OpenRouter #${openRouterKeyRotationIndex + 1} parece ser um placeholder. Pulando...`);
+                        openRouterKeyRotationIndex = (openRouterKeyRotationIndex + 1) % OPENROUTER_API_KEYS.length;
                         continue;
                     }
 
-                    const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
-                    const body = JSON.stringify({
-                        model: DEEPSEEK_MODEL_NAME,
-                        messages: [ { role: 'user', content: textPrompt } ],
+                    const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
+                    const requestBody = JSON.stringify({
+                        model: DEEPSEEK_MODEL_IDENTIFIER,
+                        messages: [ { role: 'user', content: composedTextPrompt } ],
                         max_tokens: 1024
                     });
 
                     try {
-                        const response = await fetchWithTimeout(API_URL, {
+                        const apiResponse = await fetchWithTimeout(OPENROUTER_ENDPOINT, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${currentKey}`,
+                                'Authorization': `Bearer ${activeKey}`,
                                 'HTTP-Referer': 'https://github.com/Nearz1',
                                 'X-Title': 'Quizizz Bypass Script'
                             },
-                            body: body
+                            body: requestBody
                         });
 
-                        if (response.ok) {
-                            const data = await response.json();
-                            aiResponseText = data.choices[0].message.content;
-                            console.log(`Sucesso com a Chave OpenRouter #${currentOpenRouterKeyIndex + 1}.`);
+                        if (apiResponse.ok) {
+                            const responseBody = await apiResponse.json();
+                            resolvedAiResponse = responseBody.choices[0].message.content;
+                            console.log(`Sucesso com a Chave OpenRouter #${openRouterKeyRotationIndex + 1}.`);
                             break;
                         }
 
-                        const errorData = await response.json();
-                        const errorMessage = errorData.error?.message || `Erro ${response.status}`;
-                        console.warn(`Chave OpenRouter #${currentOpenRouterKeyIndex + 1} falhou: ${errorMessage}. Tentando a próxima...`);
-                        lastAiResponse = `Falha na Chave OpenRouter #${currentOpenRouterKeyIndex + 1}: ${errorMessage}`;
+                        const errorBody = await apiResponse.json();
+                        const errorDetail = errorBody.error?.message || `Erro ${apiResponse.status}`;
+                        console.warn(`Chave OpenRouter #${openRouterKeyRotationIndex + 1} falhou: ${errorDetail}. Tentando a próxima...`);
+                        rawAiResponseCache = `Falha na Chave OpenRouter #${openRouterKeyRotationIndex + 1}: ${errorDetail}`;
 
-                    } catch (error) {
-                         console.warn(`Erro na requisição com a Chave OpenRouter #${currentOpenRouterKeyIndex + 1}: ${error.message}. Tentando a próxima...`);
-                         lastAiResponse = `Falha na Chave OpenRouter #${currentOpenRouterKeyIndex + 1}: ${error.message}`;
+                    } catch (requestError) {
+                        console.warn(`Erro na requisição com a Chave OpenRouter #${openRouterKeyRotationIndex + 1}: ${requestError.message}. Tentando a próxima...`);
+                        rawAiResponseCache = `Falha na Chave OpenRouter #${openRouterKeyRotationIndex + 1}: ${requestError.message}`;
                     }
 
-                    currentOpenRouterKeyIndex = (currentOpenRouterKeyIndex + 1) % OPENROUTER_API_KEYS.length;
-                    if (i === OPENROUTER_API_KEYS.length - 1) {
-                        deepseekKeyFailed = true;
+                    openRouterKeyRotationIndex = (openRouterKeyRotationIndex + 1) % OPENROUTER_API_KEYS.length;
+                    if (attemptIndex === OPENROUTER_API_KEYS.length - 1) {
+                        allOpenRouterKeysFailed = true;
                     }
                 }
 
-                if (!aiResponseText && deepseekKeyFailed) {
+                if (!resolvedAiResponse && allOpenRouterKeysFailed) {
                     throw new Error("Todas as chaves de API do OpenRouter falharam.");
                 }
             }
 
-            // --- 4. Retorno ---
-            console.log("Resposta bruta da IA:", aiResponseText);
-            lastAiResponse = aiResponseText;
-            return aiResponseText;
+            console.log("Resposta bruta da IA:", resolvedAiResponse);
+            rawAiResponseCache = resolvedAiResponse;
+            return resolvedAiResponse;
 
-        } catch (error) {
-            console.error(`Falha ao obter resposta da IA (${currentAiProvider}):`, error.message);
-            lastAiResponse = `Erro: ${error.message}`;
-            throw error;
+        } catch (fatalError) {
+            console.error(`Falha ao obter resposta da IA (${activeAiProvider}):`, fatalError.message);
+            rawAiResponseCache = `Erro: ${fatalError.message}`;
+            throw fatalError;
         }
     }
 
 
-    async function performAction(aiAnswerText, quizData) {
-        if (!aiAnswerText) return;
+    async function applyAiSolution(aiResponseText, questionPayload) {
+        if (!aiResponseText) return;
 
-        const getElementColor = (element) => {
-            const style = window.getComputedStyle(element);
-            const bgImage = style.backgroundImage;
-            if (bgImage && bgImage.includes('gradient')) {
-                const match = bgImage.match(/rgb\(\d+, \d+, \d+\)/);
-                if (match) return match[0];
+        const resolveElementAccentColor = (element) => {
+            const computedStyle = window.getComputedStyle(element);
+            const backgroundGradient = computedStyle.backgroundImage;
+            if (backgroundGradient && backgroundGradient.includes('gradient')) {
+                const colorCapture = backgroundGradient.match(/rgb\(\d+, \d+, \d+\)/);
+                if (colorCapture) return colorCapture[0];
             }
-            return style.backgroundColor || 'rgba(0, 255, 0, 0.5)';
+            return computedStyle.backgroundColor || 'rgba(0, 255, 0, 0.5)';
         };
 
-        switch (quizData.questionType) {
+        switch (questionPayload.questionType) {
             case 'drag_and_drop_image':
-                const cleanDndImgPart = (str) => str.replace(/[`"']/g, '').trim();
-                const pairingsDndImg = aiAnswerText.split('\n').filter(line => line.includes('->')).map(line => {
-                    const parts = line.split('->');
-                    return parts.length === 2 ? [cleanDndImgPart(parts[0]), cleanDndImgPart(parts[1])] : null;
+                const stripDndQuotes = (str) => str.replace(/[`"']/g, '').trim();
+                const dndImagePairings = aiResponseText.split('\n').filter(line => line.includes('->')).map(line => {
+                    const segments = line.split('->');
+                    return segments.length === 2 ? [stripDndQuotes(segments[0]), stripDndQuotes(segments[1])] : null;
                 }).filter(Boolean);
 
-                if (pairingsDndImg.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA para drag and drop na imagem."); return; }
+                if (dndImagePairings.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA para drag and drop na imagem."); return; }
 
-                const optionsMapDndImg = new Map(quizData.draggableOptions.map(i => [i.text, i.element]));
-                const dropZonesMapDndImg = new Map(quizData.dropZones.map(i => [i.id, i.element]));
+                const dndLabelIndex = new Map(questionPayload.draggableOptions.map(i => [i.text, i.element]));
+                const dndZoneIndex = new Map(questionPayload.dropZones.map(i => [i.id, i.element]));
 
-                const highlightColorsDnd = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
-                let colorIndexDnd = 0;
+                const dndColorPalette = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
+                let dndColorCursor = 0;
 
-                for (const [espacoId, labelText] of pairingsDndImg) {
-                    let sourceEl = optionsMapDndImg.get(labelText);
-                    if (!sourceEl) {
-                        const foundKey = [...optionsMapDndImg.keys()].find(k => k.includes(labelText) || labelText.includes(k));
-                        if(foundKey) sourceEl = optionsMapDndImg.get(foundKey);
+                for (const [zoneId, labelText] of dndImagePairings) {
+                    let sourceNode = dndLabelIndex.get(labelText);
+                    if (!sourceNode) {
+                        const partialKey = [...dndLabelIndex.keys()].find(k => k.includes(labelText) || labelText.includes(k));
+                        if (partialKey) sourceNode = dndLabelIndex.get(partialKey);
                     }
-                    const destinationEl = dropZonesMapDndImg.get(espacoId);
+                    const targetNode = dndZoneIndex.get(zoneId);
 
-                    if (sourceEl && destinationEl) {
-                        const color = highlightColorsDnd[colorIndexDnd % highlightColorsDnd.length];
-                        const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 8px; border: 2px solid ${color} !important;`;
-                        sourceEl.style.cssText += highlightStyle;
+                    if (sourceNode && targetNode) {
+                        const accentColor = dndColorPalette[dndColorCursor % dndColorPalette.length];
+                        const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 8px; border: 2px solid ${accentColor} !important;`;
+                        sourceNode.style.cssText += highlightRule;
 
-                        // Destacando a bolinha na imagem com a cor sem alterar o tamanho (v52.1)
-                        destinationEl.style.backgroundColor = color;
-                        destinationEl.style.opacity = '0.9';
-                        destinationEl.style.boxShadow = `0 0 10px 5px ${color}`;
-                        destinationEl.style.border = `2px solid #fff`;
-                        destinationEl.style.zIndex = '100';
+                        targetNode.style.backgroundColor = accentColor;
+                        targetNode.style.opacity = '0.9';
+                        targetNode.style.boxShadow = `0 0 10px 5px ${accentColor}`;
+                        targetNode.style.border = `2px solid #fff`;
+                        targetNode.style.zIndex = '100';
 
-                        colorIndexDnd++;
+                        dndColorCursor++;
                     } else {
-                        console.warn(`Par não encontrado na tela: "${espacoId}" -> "${labelText}"`);
+                        console.warn(`Par não encontrado na tela: "${zoneId}" -> "${labelText}"`);
                     }
                 }
                 break;
 
             case 'categorize':
-                const cleanCatPart = (str) => str.replace(/[`"']/g, '').trim();
-                const pairingsCat = aiAnswerText.split('\n').filter(line => line.includes('->')).map(line => {
-                    const parts = line.split('->');
-                    return parts.length === 2 ? [cleanCatPart(parts[0]), cleanCatPart(parts[1])] : null;
+                const stripCatQuotes = (str) => str.replace(/[`"']/g, '').trim();
+                const categorizationPairings = aiResponseText.split('\n').filter(line => line.includes('->')).map(line => {
+                    const segments = line.split('->');
+                    return segments.length === 2 ? [stripCatQuotes(segments[0]), stripCatQuotes(segments[1])] : null;
                 }).filter(Boolean);
 
-                if (pairingsCat.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA para categorização."); return; }
+                if (categorizationPairings.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA para categorização."); return; }
 
-                const draggablesMapCat = new Map(quizData.draggables.map(i => [i.text, i.element]));
-                const categoriesMapCat = new Map(quizData.categories.map(i => [i.name, i.element]));
+                const draggableNodeIndex = new Map(questionPayload.draggables.map(i => [i.text, i.element]));
+                const categoryNodeIndex = new Map(questionPayload.categories.map(i => [i.name, i.element]));
 
-                const catColors = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
-                let catColorMap = new Map();
-                let colorIdx = 0;
+                const categoryColorPalette = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
+                const categoryColorAssignment = new Map();
+                let categoryColorCursor = 0;
 
-                for (const [itemText, catName] of pairingsCat) {
-                    let sourceEl = draggablesMapCat.get(itemText);
-                    if (!sourceEl) {
-                        const foundKey = [...draggablesMapCat.keys()].find(k => k.includes(itemText) || itemText.includes(k));
-                        if(foundKey) sourceEl = draggablesMapCat.get(foundKey);
+                for (const [itemLabel, categoryName] of categorizationPairings) {
+                    let sourceNode = draggableNodeIndex.get(itemLabel);
+                    if (!sourceNode) {
+                        const partialKey = [...draggableNodeIndex.keys()].find(k => k.includes(itemLabel) || itemLabel.includes(k));
+                        if (partialKey) sourceNode = draggableNodeIndex.get(partialKey);
                     }
 
-                    let destinationEl = categoriesMapCat.get(catName);
-                    if (!destinationEl) {
-                        const foundCatKey = [...categoriesMapCat.keys()].find(k => k.includes(catName) || catName.includes(k));
-                        if(foundCatKey) destinationEl = categoriesMapCat.get(foundCatKey);
+                    let targetNode = categoryNodeIndex.get(categoryName);
+                    if (!targetNode) {
+                        const partialCatKey = [...categoryNodeIndex.keys()].find(k => k.includes(categoryName) || categoryName.includes(k));
+                        if (partialCatKey) targetNode = categoryNodeIndex.get(partialCatKey);
                     }
 
-                    if (sourceEl && destinationEl) {
-                        if (!catColorMap.has(catName)) {
-                            catColorMap.set(catName, catColors[colorIdx % catColors.length]);
-                            colorIdx++;
+                    if (sourceNode && targetNode) {
+                        if (!categoryColorAssignment.has(categoryName)) {
+                            categoryColorAssignment.set(categoryName, categoryColorPalette[categoryColorCursor % categoryColorPalette.length]);
+                            categoryColorCursor++;
                         }
-                        const color = catColorMap.get(catName);
+                        const accentColor = categoryColorAssignment.get(categoryName);
 
-                        const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 8px; border: 2px solid ${color};`;
-                        sourceEl.style.cssText += highlightStyle;
+                        const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 8px; border: 2px solid ${accentColor};`;
+                        sourceNode.style.cssText += highlightRule;
 
-                        destinationEl.style.border = `2px solid ${color}`;
-                        destinationEl.style.boxShadow = `inset 0 0 20px ${color}`;
+                        targetNode.style.border = `2px solid ${accentColor}`;
+                        targetNode.style.boxShadow = `inset 0 0 20px ${accentColor}`;
                     } else {
-                        console.warn(`Item ou categoria não encontrados: "${itemText}" -> "${catName}"`);
+                        console.warn(`Item ou categoria não encontrados: "${itemLabel}" -> "${categoryName}"`);
                     }
                 }
                 break;
 
             case 'multi_dropdown':
-                const popperSelector = '.v-popper__popper--shown';
-                const answers = aiAnswerText.split('\n').map(line => {
-                    const match = line.match(/\[RESPOSTA (\d+)\]:\s*(.*)/i);
-                    if (!match) return null;
+                const activePopperSelector = '.v-popper__popper--shown';
+                const parsedDropdownAnswers = aiResponseText.split('\n').map(line => {
+                    const captured = line.match(/\[RESPOSTA (\d+)\]:\s*(.*)/i);
+                    if (!captured) return null;
                     return {
-                        index: parseInt(match[1], 10) - 1,
-                        answer: match[2].trim().replace(/["'`]/g, '')
+                        index: parseInt(captured[1], 10) - 1,
+                        answer: captured[2].trim().replace(/["'`]/g, '')
                     };
                 }).filter(Boolean);
 
-                const answersMap = new Map(answers.map(a => [a.index, a.answer]));
-                const placeholderText = 'Selecionar resposta';
+                const dropdownAnswerIndex = new Map(parsedDropdownAnswers.map(a => [a.index, a.answer]));
+                const emptyDropdownLabel = 'Selecionar resposta';
 
-                // Fase 1: Limpeza
                 console.log("FASE 1: Limpando dropdowns com respostas erradas ou desnecessárias...");
-                for (let i = 0; i < quizData.dropdowns.length; i++) {
-                    const dd = quizData.dropdowns[i];
-                    const currentButtonText = dd.button.innerText.trim();
-                    const targetAnswer = answersMap.get(i);
+                for (let ddIndex = 0; ddIndex < questionPayload.dropdowns.length; ddIndex++) {
+                    const dropdownEntry = questionPayload.dropdowns[ddIndex];
+                    const currentSelection = dropdownEntry.button.innerText.trim();
+                    const expectedAnswer = dropdownAnswerIndex.get(ddIndex);
 
-                    const isFilled = currentButtonText !== placeholderText;
-                    const hasTarget = !!targetAnswer;
-                    const isWrong = isFilled && hasTarget && currentButtonText !== targetAnswer;
-                    const isUnnecessary = isFilled && !hasTarget;
+                    const isAlreadyFilled = currentSelection !== emptyDropdownLabel;
+                    const hasExpectedAnswer = !!expectedAnswer;
+                    const isWrongSelection = isAlreadyFilled && hasExpectedAnswer && currentSelection !== expectedAnswer;
+                    const isUnnecessarySelection = isAlreadyFilled && !hasExpectedAnswer;
 
-                    if (isWrong || isUnnecessary) {
-                        console.log(`Limpando Dropdown #${i + 1} (estava com "${currentButtonText}")...`);
-                        dd.button.click();
+                    if (isWrongSelection || isUnnecessarySelection) {
+                        console.log(`Limpando Dropdown #${ddIndex + 1} (estava com "${currentSelection}")...`);
+                        dropdownEntry.button.click();
                         try {
-                            const optionElements = await waitForElement(`${popperSelector} button.dropdown-option`, true, 2000);
-                            const selectedOption = Array.from(optionElements).find(el => el.innerText.trim() === currentButtonText);
-                            if (selectedOption) {
-                                selectedOption.click();
+                            const visibleOptions = await waitForElement(`${activePopperSelector} button.dropdown-option`, true, 2000);
+                            const activeOption = Array.from(visibleOptions).find(el => el.innerText.trim() === currentSelection);
+                            if (activeOption) {
+                                activeOption.click();
                             } else {
                                 document.body.click();
                             }
-                            await waitForElementToDisappear(popperSelector, 2000);
-                        } catch (e) {
-                            console.error(`Erro ao tentar limpar Dropdown #${i + 1}: ${e.message}`);
-                            if (document.querySelector(popperSelector)) {
+                            await waitForElementToDisappear(activePopperSelector, 2000);
+                        } catch (cleanupError) {
+                            console.error(`Erro ao tentar limpar Dropdown #${ddIndex + 1}: ${cleanupError.message}`);
+                            if (document.querySelector(activePopperSelector)) {
                                 document.body.click();
-                                try { await waitForElementToDisappear(popperSelector, 2000); } catch (err) {}
+                                try { await waitForElementToDisappear(activePopperSelector, 2000); } catch (innerError) {}
                             }
                         }
                     }
                 }
 
-                // Fase 2: Preenchimento
                 console.log("FASE 2: Preenchendo respostas corretas da IA...");
-                for (const res of answers) {
-                    const dd = quizData.dropdowns[res.index];
-                    if (!dd) {
-                        console.error(`Dropdown com índice ${res.index} não encontrado.`);
+                for (const dropdownAnswer of parsedDropdownAnswers) {
+                    const dropdownEntry = questionPayload.dropdowns[dropdownAnswer.index];
+                    if (!dropdownEntry) {
+                        console.error(`Dropdown com índice ${dropdownAnswer.index} não encontrado.`);
                         continue;
                     }
-                    const currentButtonText = dd.button.innerText.trim();
-                    if (currentButtonText === res.answer) {
+                    const currentSelection = dropdownEntry.button.innerText.trim();
+                    if (currentSelection === dropdownAnswer.answer) {
                         continue;
                     }
-                    dd.button.click();
+                    dropdownEntry.button.click();
                     try {
-                        const optionElements = await waitForElement(`${popperSelector} button.dropdown-option`, true, 2000);
-                        const targetOption = Array.from(optionElements).find(el => el.innerText.trim() === res.answer);
-                        if (targetOption) {
-                            if (targetOption.disabled || targetOption.classList.contains('used-option')) {
-                                console.warn(`Opção "${res.answer}" para Dropdown #${res.index + 1} ainda está desabilitada.`);
+                        const visibleOptions = await waitForElement(`${activePopperSelector} button.dropdown-option`, true, 2000);
+                        const matchingOption = Array.from(visibleOptions).find(el => el.innerText.trim() === dropdownAnswer.answer);
+                        if (matchingOption) {
+                            if (matchingOption.disabled || matchingOption.classList.contains('used-option')) {
+                                console.warn(`Opção "${dropdownAnswer.answer}" para Dropdown #${dropdownAnswer.index + 1} ainda está desabilitada.`);
                                 document.body.click();
                             } else {
-                                targetOption.click();
+                                matchingOption.click();
                             }
                         } else {
-                            console.error(`Opção "${res.answer}" não encontrada no Dropdown #${res.index + 1}. (A IA pode ter alucinado)`);
+                            console.error(`Opção "${dropdownAnswer.answer}" não encontrada no Dropdown #${dropdownAnswer.index + 1}. (A IA pode ter alucinado)`);
                             document.body.click();
                         }
-                        await waitForElementToDisappear(popperSelector, 2000);
-                    } catch (e) {
-                        console.error(`Erro ao tentar selecionar para o dropdown #${res.index + 1}: ${e.message}`);
-                        if (document.querySelector(popperSelector)) {
+                        await waitForElementToDisappear(activePopperSelector, 2000);
+                    } catch (selectionError) {
+                        console.error(`Erro ao tentar selecionar para o dropdown #${dropdownAnswer.index + 1}: ${selectionError.message}`);
+                        if (document.querySelector(activePopperSelector)) {
                             document.body.click();
-                            try { await waitForElementToDisappear(popperSelector, 2000); } catch (err) {}
+                            try { await waitForElementToDisappear(activePopperSelector, 2000); } catch (innerError) {}
                         }
                     }
                 }
                 break;
 
             case 'multi_drag_into_blank':
-                const highlightColors = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
-                let colorIndex = 0;
-                const cleanPairPartMulti = (str) => str.replace(/[`"']/g, '').trim();
-                const pairingsMulti = aiAnswerText.split('\n').filter(line => line.includes('->')).map(line => {
-                    const parts = line.split('->');
-                    return parts.length === 2 ? [cleanPairPartMulti(parts[0]), cleanPairPartMulti(parts[1])] : null;
+                const multiDndColorPalette = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
+                let multiDndColorCursor = 0;
+                const stripMultiDndQuotes = (str) => str.replace(/[`"']/g, '').trim();
+                const multiDndPairings = aiResponseText.split('\n').filter(line => line.includes('->')).map(line => {
+                    const segments = line.split('->');
+                    return segments.length === 2 ? [stripMultiDndQuotes(segments[0]), stripMultiDndQuotes(segments[1])] : null;
                 }).filter(Boolean);
-                if (pairingsMulti.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA."); return; }
-                const draggableMap = new Map(quizData.draggableOptions.map(i => [i.text, i.element]));
-                const dropZoneMap = new Map(quizData.dropZones.map(i => [i.prompt, i.blankElement]));
-                for (const [promptText, optionText] of pairingsMulti) {
-                    const bestPromptMatch = [...dropZoneMap.keys()].find(key => key.includes(promptText) || promptText.includes(key));
-                    const blankEl = dropZoneMap.get(bestPromptMatch);
-                    const optionEl = draggableMap.get(optionText);
-                    if (blankEl && optionEl) {
-                        const color = highlightColors[colorIndex % highlightColors.length];
-                        const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 4px;`;
-                        blankEl.style.cssText = highlightStyle;
-                        optionEl.style.cssText = highlightStyle;
-                        colorIndex++;
+                if (multiDndPairings.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA."); return; }
+                const draggableLabelNodeIndex = new Map(questionPayload.draggableOptions.map(i => [i.text, i.element]));
+                const blankZoneNodeIndex = new Map(questionPayload.dropZones.map(i => [i.prompt, i.blankElement]));
+                for (const [sentenceFragment, optionLabel] of multiDndPairings) {
+                    const closestPromptKey = [...blankZoneNodeIndex.keys()].find(key => key.includes(sentenceFragment) || sentenceFragment.includes(key));
+                    const blankNode = blankZoneNodeIndex.get(closestPromptKey);
+                    const optionNode = draggableLabelNodeIndex.get(optionLabel);
+                    if (blankNode && optionNode) {
+                        const accentColor = multiDndColorPalette[multiDndColorCursor % multiDndColorPalette.length];
+                        const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 4px;`;
+                        blankNode.style.cssText = highlightRule;
+                        optionNode.style.cssText = highlightRule;
+                        multiDndColorCursor++;
                     } else {
-                        console.warn(`Par não encontrado no DOM: "${promptText}" -> "${optionText}"`);
+                        console.warn(`Par não encontrado no DOM: "${sentenceFragment}" -> "${optionLabel}"`);
                     }
                 }
                 break;
 
             case 'equation':
-                const KEYPAD_MAP = {
+                const EQUATION_KEYPAD_MAP = {
                     '0': 'icon-fas-0', '1': 'icon-fas-1', '2': 'icon-fas-2', '3': 'icon-fas-3', '4': 'icon-fas-4',
                     '5': 'icon-fas-5', '6': 'icon-fas-6', '7': 'icon-fas-7', '8': 'icon-fas-8', '9': 'icon-fas-9',
                     '+': 'icon-fas-plus', '-': 'icon-fas-minus', '*': 'icon-fas-times', '×': 'icon-fas-times',
@@ -736,166 +723,165 @@
                     '(': 'icon-fas-brackets-round', ')': 'icon-fas-brackets-round',
                     'π': 'icon-fas-pi', 'e': 'icon-fas-euler',
                 };
-                let answerSequence = aiAnswerText.trim().replace(/\s/g, '').replace(/<=/g, '≤').replace(/>=/g, '≥');
-                console.log(`Digitando a resposta: ${answerSequence}`);
-                const editor = document.querySelector('div[data-cy="equation-editor"]');
-                if (editor) {
-                    editor.click();
+                let normalizedEquationSequence = aiResponseText.trim().replace(/\s/g, '').replace(/<=/g, '≤').replace(/>=/g, '≥');
+                console.log(`Digitando a resposta: ${normalizedEquationSequence}`);
+                const equationEditorNode = document.querySelector('div[data-cy="equation-editor"]');
+                if (equationEditorNode) {
+                    equationEditorNode.click();
                     await new Promise(r => setTimeout(r, 100));
                 } else {
                     console.error("Não foi possível encontrar o editor de equação para focar.");
                     return;
                 }
-                for (const char of answerSequence) {
-                    const iconClass = KEYPAD_MAP[char.toLowerCase()];
-                    if (iconClass) {
-                        const keyElement = document.querySelector(`.editor-button i.${iconClass}`);
-                        if (keyElement) {
-                            const button = keyElement.closest('button');
-                            if (button) {
-                                button.click();
+                for (const character of normalizedEquationSequence) {
+                    const keyIconClass = EQUATION_KEYPAD_MAP[character.toLowerCase()];
+                    if (keyIconClass) {
+                        const iconNode = document.querySelector(`.editor-button i.${keyIconClass}`);
+                        if (iconNode) {
+                            const keyButton = iconNode.closest('button');
+                            if (keyButton) {
+                                keyButton.click();
                                 await new Promise(r => setTimeout(r, 100));
                             }
                         } else {
-                            console.error(`Não foi possível encontrar a tecla para o caractere: "${char}" (ícone: ${iconClass})`);
+                            console.error(`Não foi possível encontrar a tecla para o caractere: "${character}" (ícone: ${keyIconClass})`);
                         }
                     } else {
-                        console.error(`Caractere não mapeado no teclado: "${char}"`);
+                        console.error(`Caractere não mapeado no teclado: "${character}"`);
                     }
                 }
                 break;
 
             case 'reorder':
-                const cleanText = (str) => str.replace(/["'`]/g, '').trim();
-                const orderedItems = aiAnswerText.split('\n').map(cleanText).filter(Boolean);
-                const draggablesMapReorder = new Map(quizData.draggableItems.map(i => [i.text, i.element]));
-                const dropZonesInOrder = quizData.dropZones;
-                if (orderedItems.length === dropZonesInOrder.length) {
-                    for (let i = 0; i < orderedItems.length; i++) {
-                        const sourceText = orderedItems[i];
-                        const sourceEl = draggablesMapReorder.get(sourceText);
-                        const destinationEl = dropZonesInOrder[i].element;
-                        if (sourceEl && destinationEl) {
-                            const color = getElementColor(sourceEl);
-                            const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 8px;`;
-                            sourceEl.style.cssText = highlightStyle;
-                            destinationEl.style.cssText = highlightStyle;
+                const stripReorderQuotes = (str) => str.replace(/["'`]/g, '').trim();
+                const reorderSequence = aiResponseText.split('\n').map(stripReorderQuotes).filter(Boolean);
+                const reorderNodeIndex = new Map(questionPayload.draggableItems.map(i => [i.text, i.element]));
+                const orderedDropTargets = questionPayload.dropZones;
+                if (reorderSequence.length === orderedDropTargets.length) {
+                    for (let sequenceIndex = 0; sequenceIndex < reorderSequence.length; sequenceIndex++) {
+                        const itemLabel = reorderSequence[sequenceIndex];
+                        const sourceNode = reorderNodeIndex.get(itemLabel);
+                        const targetNode = orderedDropTargets[sequenceIndex].element;
+                        if (sourceNode && targetNode) {
+                            const accentColor = resolveElementAccentColor(sourceNode);
+                            const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 8px;`;
+                            sourceNode.style.cssText = highlightRule;
+                            targetNode.style.cssText = highlightRule;
                         }
                     }
                 }
                 break;
 
             case 'drag_into_blank':
-                const cleanAiAnswerBlank = aiAnswerText.trim().replace(/["'`]/g, '');
-                const targetOption = quizData.draggableOptions.find(opt => opt.text === cleanAiAnswerBlank);
-                if (targetOption) {
-                    const color = getElementColor(targetOption.element);
-                    const highlightStyle = `box-shadow: 0 0 15px 5px ${color}`;
-                    targetOption.element.style.cssText = highlightStyle;
-                    quizData.dropZone.element.style.cssText = highlightStyle;
+                const cleanedBlankAnswer = aiResponseText.trim().replace(/["'`]/g, '');
+                const matchedOption = questionPayload.draggableOptions.find(opt => opt.text === cleanedBlankAnswer);
+                if (matchedOption) {
+                    const accentColor = resolveElementAccentColor(matchedOption.element);
+                    const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}`;
+                    matchedOption.element.style.cssText = highlightRule;
+                    questionPayload.dropZone.element.style.cssText = highlightRule;
                 }
                 break;
 
             case 'match_image_to_text':
-                const highlightColorsImg = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
-                let colorIndexImg = 0;
+                const matchImgColorPalette = ['#FFD700', '#00FFFF', '#FF00FF', '#7FFF00', '#FF8C00', '#DA70D6'];
+                let matchImgColorCursor = 0;
+                const stripMatchImgQuotes = (str) => str.replace(/[`"\[\]]/g, '').trim();
 
-                const cleanPairPartImg = (str) => str.replace(/[`"\[\]]/g, '').trim();
-
-                const pairingsImg = aiAnswerText.split('\n').filter(line => line.includes('->')).map(line => {
-                    const parts = line.split('->');
-                    return parts.length === 2 ? [cleanPairPartImg(parts[0]), cleanPairPartImg(parts[1])] : null;
+                const matchImgPairings = aiResponseText.split('\n').filter(line => line.includes('->')).map(line => {
+                    const segments = line.split('->');
+                    return segments.length === 2 ? [stripMatchImgQuotes(segments[0]), stripMatchImgQuotes(segments[1])] : null;
                 }).filter(Boolean);
 
-                if (pairingsImg.length === 0) { console.error("Não foi possível extrair pares válidos (Texto -> ID Imagem) da resposta da IA."); return; }
+                if (matchImgPairings.length === 0) { console.error("Não foi possível extrair pares válidos (Texto -> ID Imagem) da resposta da IA."); return; }
 
-                const draggablesMapImg = new Map(quizData.draggableItems.map(i => [i.id, i.element]));
-                const dropZonesMapImg = new Map(quizData.dropZones.map(i => [i.text, i.element]));
+                const imageItemNodeIndex = new Map(questionPayload.draggableItems.map(i => [i.id, i.element]));
+                const textTargetNodeIndex = new Map(questionPayload.dropZones.map(i => [i.text, i.element]));
 
-                for (const [partA, partB] of pairingsImg) {
-                    let sourceEl, destinationEl;
-                    if (dropZonesMapImg.has(partA) && draggablesMapImg.has(partB)) {
-                        destinationEl = dropZonesMapImg.get(partA);
-                        sourceEl = draggablesMapImg.get(partB);
-                    } else if (dropZonesMapImg.has(partB) && draggablesMapImg.has(partA)) {
-                        destinationEl = dropZonesMapImg.get(partB);
-                        sourceEl = draggablesMapImg.get(partA);
+                for (const [segmentA, segmentB] of matchImgPairings) {
+                    let sourceNode, targetNode;
+                    if (textTargetNodeIndex.has(segmentA) && imageItemNodeIndex.has(segmentB)) {
+                        targetNode = textTargetNodeIndex.get(segmentA);
+                        sourceNode = imageItemNodeIndex.get(segmentB);
+                    } else if (textTargetNodeIndex.has(segmentB) && imageItemNodeIndex.has(segmentA)) {
+                        targetNode = textTargetNodeIndex.get(segmentB);
+                        sourceNode = imageItemNodeIndex.get(segmentA);
                     } else {
-                        console.warn(`Par não mapeado: "${partA}" (existe? ${dropZonesMapImg.has(partA)}) -> "${partB}" (existe? ${draggablesMapImg.has(partB)})`);
+                        console.warn(`Par não mapeado: "${segmentA}" (existe? ${textTargetNodeIndex.has(segmentA)}) -> "${segmentB}" (existe? ${imageItemNodeIndex.has(segmentB)})`);
                         continue;
                     }
 
-                    if (sourceEl && destinationEl) {
-                        const color = highlightColorsImg[colorIndexImg % highlightColorsImg.length];
-                        const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 8px;`;
-                        sourceEl.style.cssText = highlightStyle;
-                        destinationEl.style.cssText = highlightStyle;
-                        colorIndexImg++;
+                    if (sourceNode && targetNode) {
+                        const accentColor = matchImgColorPalette[matchImgColorCursor % matchImgColorPalette.length];
+                        const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 8px;`;
+                        sourceNode.style.cssText = highlightRule;
+                        targetNode.style.cssText = highlightRule;
+                        matchImgColorCursor++;
                     }
                 }
                 break;
 
             case 'match_order':
-                const cleanPairPart = (str) => str.replace(/[`"']/g, '').trim();
-                const pairings = aiAnswerText.split('\n').filter(line => line.includes('->')).map(line => {
-                    const parts = line.split('->');
-                    return parts.length === 2 ? [cleanPairPart(parts[0]), cleanPairPart(parts[1])] : null;
+                const stripMatchQuotes = (str) => str.replace(/[`"']/g, '').trim();
+                const matchOrderPairings = aiResponseText.split('\n').filter(line => line.includes('->')).map(line => {
+                    const segments = line.split('->');
+                    return segments.length === 2 ? [stripMatchQuotes(segments[0]), stripMatchQuotes(segments[1])] : null;
                 }).filter(Boolean);
-                if (pairings.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA."); return; }
-                const draggablesMapMatch = new Map(quizData.draggableItems.map(i => [i.text, i.element]));
-                const dropZonesMap = new Map(quizData.dropZones.map(i => [i.text, i.element]));
-                for (const [partA, partB] of pairings) {
-                    let sourceEl, destinationEl;
-                    if (dropZonesMap.has(partA) && draggablesMapMatch.has(partB)) {
-                        destinationEl = dropZonesMap.get(partA);
-                        sourceEl = draggablesMapMatch.get(partB);
-                    } else if (dropZonesMap.has(partB) && draggablesMapMatch.has(partA)) {
-                        destinationEl = dropZonesMap.get(partB);
-                        sourceEl = draggablesMapMatch.get(partA);
+                if (matchOrderPairings.length === 0) { console.error("Não foi possível extrair pares válidos da resposta da IA."); return; }
+                const draggableTileIndex = new Map(questionPayload.draggableItems.map(i => [i.text, i.element]));
+                const dropTargetIndex = new Map(questionPayload.dropZones.map(i => [i.text, i.element]));
+                for (const [segmentA, segmentB] of matchOrderPairings) {
+                    let sourceNode, targetNode;
+                    if (dropTargetIndex.has(segmentA) && draggableTileIndex.has(segmentB)) {
+                        targetNode = dropTargetIndex.get(segmentA);
+                        sourceNode = draggableTileIndex.get(segmentB);
+                    } else if (dropTargetIndex.has(segmentB) && draggableTileIndex.has(segmentA)) {
+                        targetNode = dropTargetIndex.get(segmentB);
+                        sourceNode = draggableTileIndex.get(segmentA);
                     } else { continue; }
-                    if (sourceEl && destinationEl) {
-                        const color = getElementColor(sourceEl);
-                        const highlightStyle = `box-shadow: 0 0 15px 5px ${color}; border-radius: 8px;`;
-                        sourceEl.style.cssText = highlightStyle;
-                        destinationEl.style.cssText = highlightStyle;
+                    if (sourceNode && targetNode) {
+                        const accentColor = resolveElementAccentColor(sourceNode);
+                        const highlightRule = `box-shadow: 0 0 15px 5px ${accentColor}; border-radius: 8px;`;
+                        sourceNode.style.cssText = highlightRule;
+                        targetNode.style.cssText = highlightRule;
                     }
                 }
                 break;
 
             default:
-                const normalize = (str) => {
+                const normalizeText = (str) => {
                     if (typeof str !== 'string') return '';
-                    let cleaned = str.replace(/[^a-zA-Z\u00C0-\u017F0-9\s²³]/g, '').replace(/\s+/g, ' ');
-                    return cleaned.trim().toLowerCase();
+                    let sanitized = str.replace(/[^a-zA-Z\u00C0-\u017F0-9\s²³]/g, '').replace(/\s+/g, ' ');
+                    return sanitized.trim().toLowerCase();
                 };
 
-                if (quizData.questionType === 'open_ended') {
+                if (questionPayload.questionType === 'open_ended') {
                     await new Promise(resolve => {
-                        quizData.answerElement.focus();
-                        quizData.answerElement.value = aiAnswerText.trim();
-                        quizData.answerElement.dispatchEvent(new Event('input', { bubbles: true }));
+                        questionPayload.answerElement.focus();
+                        questionPayload.answerElement.value = aiResponseText.trim();
+                        questionPayload.answerElement.dispatchEvent(new Event('input', { bubbles: true }));
                         setTimeout(resolve, 100);
                     });
                     setTimeout(() => document.querySelector('.submit-button-wrapper button, button.submit-btn')?.click(), 500);
-                } else if (quizData.questionType === 'multiple_choice') {
-                    const aiAnswers = aiAnswerText.split('\n').map(normalize).filter(Boolean);
-                    quizData.options.forEach(opt => {
-                        if (aiAnswers.includes(normalize(opt.text))) {
+                } else if (questionPayload.questionType === 'multiple_choice') {
+                    const normalizedAnswerSet = aiResponseText.split('\n').map(normalizeText).filter(Boolean);
+                    questionPayload.options.forEach(opt => {
+                        if (normalizedAnswerSet.includes(normalizeText(opt.text))) {
                             opt.element.style.border = '5px solid #00FF00';
                             opt.element.click();
                         }
                     });
-                } else if (quizData.questionType === 'single_choice') {
-                    const normalizedAiAnswer = normalize(aiAnswerText);
-                    const bestMatch = quizData.options.find(opt => {
-                        const normalizedOption = normalize(opt.text);
-                        return normalizedOption === normalizedAiAnswer;
+                } else if (questionPayload.questionType === 'single_choice') {
+                    const normalizedSingleAnswer = normalizeText(aiResponseText);
+                    const closestOptionMatch = questionPayload.options.find(opt => {
+                        const normalizedOption = normalizeText(opt.text);
+                        return normalizedOption === normalizedSingleAnswer;
                     });
 
-                    if (bestMatch) {
-                        console.log("Correspondência encontrada!", bestMatch.element);
-                        bestMatch.element.style.border = '5px solid #00FF00';
-                        bestMatch.element.click();
+                    if (closestOptionMatch) {
+                        console.log("Correspondência encontrada!", closestOptionMatch.element);
+                        closestOptionMatch.element.style.border = '5px solid #00FF00';
+                        closestOptionMatch.element.click();
                     } else {
                         console.warn("Nenhuma correspondência exata encontrada após normalização.");
                     }
@@ -904,110 +890,109 @@
         }
     }
 
-    async function resolverQuestao() {
-        const button = document.getElementById('ai-solver-button');
-        button.disabled = true;
-        button.innerText = "Pensando...";
-        button.style.transform = 'scale(0.95)';
-        button.style.boxShadow = '0 0 0 rgba(0,0,0,0)';
+    async function triggerQuestionSolver() {
+        const solverButton = document.getElementById('ai-solver-button');
+        solverButton.disabled = true;
+        solverButton.innerText = "Pensando...";
+        solverButton.style.transform = 'scale(0.95)';
+        solverButton.style.boxShadow = '0 0 0 rgba(0,0,0,0)';
         try {
-            const quizData = await extrairDadosDaQuestao();
-            if (!quizData) {
+            const questionPayload = await extractQuestionPayload();
+            if (!questionPayload) {
                 alert("Não foi possível extrair os dados da questão.");
                 return;
             }
 
-            if (quizData.questionType === 'multi_dropdown') {
-                 console.log("Usando IA para resolver múltiplos dropdowns (lógica de pool)...");
-                 const aiAnswer = await obterRespostaDaIA(quizData);
-                 if (aiAnswer) {
-                     await performAction(aiAnswer, quizData);
-                 }
-            } else if (quizData.questionType === 'dropdown') {
+            if (questionPayload.questionType === 'multi_dropdown') {
+                console.log("Usando IA para resolver múltiplos dropdowns (lógica de pool)...");
+                const aiSolution = await fetchAiSolution(questionPayload);
+                if (aiSolution) {
+                    await applyAiSolution(aiSolution, questionPayload);
+                }
+            } else if (questionPayload.questionType === 'dropdown') {
                 console.log("Iniciando fluxo otimizado para Dropdown...");
-                quizData.dropdownButton.click();
+                questionPayload.dropdownButton.click();
                 try {
-                    const optionElements = await waitForElement('.v-popper__popper--shown button.dropdown-option', true);
-                    quizData.options = Array.from(optionElements).map(el => ({ text: el.innerText.trim() }));
-                    const aiAnswer = await obterRespostaDaIA(quizData);
-                    if (aiAnswer) {
-                        const cleanAiAnswerDrop = aiAnswer.trim().replace(/["'`]/g, '');
-                        const targetOptionDrop = Array.from(optionElements).find(el => el.innerText.trim() === cleanAiAnswerDrop);
-                        if (targetOptionDrop) {
-                            targetOptionDrop.click();
+                    const visibleOptionNodes = await waitForElement('.v-popper__popper--shown button.dropdown-option', true);
+                    questionPayload.options = Array.from(visibleOptionNodes).map(el => ({ text: el.innerText.trim() }));
+                    const aiSolution = await fetchAiSolution(questionPayload);
+                    if (aiSolution) {
+                        const sanitizedDropdownAnswer = aiSolution.trim().replace(/["'`]/g, '');
+                        const matchingDropdownOption = Array.from(visibleOptionNodes).find(el => el.innerText.trim() === sanitizedDropdownAnswer);
+                        if (matchingDropdownOption) {
+                            matchingDropdownOption.click();
                         } else {
-                            console.error(`Não foi possível encontrar a opção dropdown com o texto: "${cleanAiAnswerDrop}"`);
+                            console.error(`Não foi possível encontrar a opção dropdown com o texto: "${sanitizedDropdownAnswer}"`);
                             document.body.click();
                         }
                     } else {
-                         document.body.click();
+                        document.body.click();
                     }
-                } catch (error) {
-                    console.error("Falha ao processar o dropdown:", error.message);
+                } catch (dropdownError) {
+                    console.error("Falha ao processar o dropdown:", dropdownError.message);
                     document.body.click();
                 }
             } else {
-                const isMath = quizData.options && quizData.options.length > 0 && (quizData.options[0].text.includes('\\') || quizData.questionText.toLowerCase().includes('value of'));
-                const matchValue = quizData.questionText.match(/value of ([\d.]+)/i);
-                if (isMath && matchValue) {
+                const isLatexMathQuestion = questionPayload.options && questionPayload.options.length > 0 && (questionPayload.options[0].text.includes('\\') || questionPayload.questionText.toLowerCase().includes('value of'));
+                const mathValueCapture = questionPayload.questionText.match(/value of ([\d.]+)/i);
+                if (isLatexMathQuestion && mathValueCapture) {
                     console.log("Questão de matemática detectada. Resolvendo localmente...");
-                    const targetValue = parseFloat(matchValue[1]);
-                    quizData.options.forEach(option => {
-                        const computableExpr = (() => {
-                            let c = option.text.replace(/\\left/g, '').replace(/\\right/g, '').replace(/\\div/g, '/').replace(/\\times/g, '*').replace(/\\ /g, '').replace(/(\d+)\s*\(/g, '$1 * (').replace(/\)\s*(\d+)/g, ') * $1');
-                            c = c.replace(/(\d+)\\frac\{(\d+)\}\{(\d+)\}/g, '($1+$2/$3)');
-                            c = c.replace(/\\frac\{(\d+)\}\{(\d+)\}/g, '($1/$2)');
-                            return c;
+                    const targetNumericValue = parseFloat(mathValueCapture[1]);
+                    questionPayload.options.forEach(option => {
+                        const evaluableExpression = (() => {
+                            let expr = option.text.replace(/\\left/g, '').replace(/\\right/g, '').replace(/\\div/g, '/').replace(/\\times/g, '*').replace(/\\ /g, '').replace(/(\d+)\s*\(/g, '$1 * (').replace(/\)\s*(\d+)/g, ') * $1');
+                            expr = expr.replace(/(\d+)\\frac\{(\d+)\}\{(\d+)\}/g, '($1+$2/$3)');
+                            expr = expr.replace(/\\frac\{(\d+)\}\{(\d+)\}/g, '($1/$2)');
+                            return expr;
                         })();
-                        const result = (() => { try { return new Function('return ' + computableExpr)(); } catch (e) { return null; } })();
-                        if (result !== null && Math.abs(result - targetValue) < 0.001) {
+                        const evaluationResult = (() => { try { return new Function('return ' + evaluableExpression)(); } catch (e) { return null; } })();
+                        if (evaluationResult !== null && Math.abs(evaluationResult - targetNumericValue) < 0.001) {
                             option.element.style.border = '5px solid #00FF00';
                             option.element.click();
                         }
                     });
                 } else {
                     console.log("Usando IA para resolver...");
-                    const aiAnswer = await obterRespostaDaIA(quizData);
-                    if (aiAnswer) {
-                        await performAction(aiAnswer, quizData);
+                    const aiSolution = await fetchAiSolution(questionPayload);
+                    if (aiSolution) {
+                        await applyAiSolution(aiSolution, questionPayload);
                     }
                 }
             }
-        } catch (error) {
-            console.error("Um erro inesperado ocorreu no fluxo principal:", error);
-            if (error.message && !error.message.includes("Ação cancelada")) {
-                alert("Ocorreu um erro: " + error.message);
+        } catch (unexpectedError) {
+            console.error("Um erro inesperado ocorreu no fluxo principal:", unexpectedError);
+            if (unexpectedError.message && !unexpectedError.message.includes("Ação cancelada")) {
+                alert("Ocorreu um erro: " + unexpectedError.message);
             }
         } finally {
-            const viewResponseBtn = document.getElementById('view-raw-response-btn');
-            if (viewResponseBtn && lastAiResponse) {
-                viewResponseBtn.style.display = 'block';
+            const rawResponseToggleBtn = document.getElementById('view-raw-response-btn');
+            if (rawResponseToggleBtn && rawAiResponseCache) {
+                rawResponseToggleBtn.style.display = 'block';
             }
-            button.disabled = false;
-            button.innerText = "✨ Resolver";
-            button.style.transform = 'scale(1)';
-            button.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.2)';
+            solverButton.disabled = false;
+            solverButton.innerText = "✨ Resolver";
+            solverButton.style.transform = 'scale(1)';
+            solverButton.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.2)';
         }
     }
 
-    // --- LÓGICA DA UI (v50) ---
 
-    function mostrarAvisoDeepSeekImagem() {
+    function renderDeepSeekImageWarningModal() {
         return new Promise((resolve, reject) => {
-            const oldModal = document.getElementById('deepseek-warning-modal');
-            if (oldModal) oldModal.remove();
+            const existingModal = document.getElementById('deepseek-warning-modal');
+            if (existingModal) existingModal.remove();
 
-            const overlay = document.createElement('div');
-            overlay.id = 'deepseek-warning-modal';
-            Object.assign(overlay.style, {
+            const overlayNode = document.createElement('div');
+            overlayNode.id = 'deepseek-warning-modal';
+            Object.assign(overlayNode.style, {
                 position: 'fixed', top: '0', left: '0', width: '100vw', height: '100vh',
                 backgroundColor: 'rgba(0, 0, 0, 0.6)', zIndex: '2147483648',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 transition: 'opacity 0.2s ease', opacity: '0'
             });
 
-            const modalContainer = document.createElement('div');
-            Object.assign(modalContainer.style, {
+            const modalContentNode = document.createElement('div');
+            Object.assign(modalContentNode.style, {
                 background: 'rgba(26, 27, 30, 0.9)', backdropFilter: 'blur(10px)',
                 padding: '24px', borderRadius: '16px', color: 'white',
                 fontFamily: 'system-ui, sans-serif', maxWidth: '400px',
@@ -1015,136 +1000,128 @@
                 border: '1px solid rgba(255, 255, 255, 0.1)'
             });
 
-            const title = document.createElement('h3');
-            title.innerText = '⚠️ DeepSeek Não Vê Imagens';
-            Object.assign(title.style, {
+            const modalTitle = document.createElement('h3');
+            modalTitle.innerText = '⚠️ DeepSeek Não Vê Imagens';
+            Object.assign(modalTitle.style, {
                 margin: '0 0 12px 0', fontSize: '18px', fontWeight: '600'
             });
 
-            const message = document.createElement('p');
-            message.innerText = 'Esta pergunta contém uma ou mais imagens que o DeepSeek não pode processar. O que você deseja fazer?';
-            Object.assign(message.style, {
+            const modalDescription = document.createElement('p');
+            modalDescription.innerText = 'Esta pergunta contém uma ou mais imagens que o DeepSeek não pode processar. O que você deseja fazer?';
+            Object.assign(modalDescription.style, {
                 margin: '0 0 20px 0', fontSize: '14px', lineHeight: '1.5',
                 color: 'rgba(255, 255, 255, 0.8)'
             });
 
-            const buttonContainer = document.createElement('div');
-            Object.assign(buttonContainer.style, {
+            const actionButtonGroup = document.createElement('div');
+            Object.assign(actionButtonGroup.style, {
                 display: 'flex', flexDirection: 'column', gap: '10px'
             });
 
-            const closeModal = () => {
-                overlay.style.opacity = '0';
-                setTimeout(() => overlay.remove(), 200);
+            const dismissModal = () => {
+                overlayNode.style.opacity = '0';
+                setTimeout(() => overlayNode.remove(), 200);
             };
 
-            const btnGemini = document.createElement('button');
-            btnGemini.innerText = 'Usar a Gemini (Recomendado)';
-            Object.assign(btnGemini.style, {
+            const switchToGeminiBtn = document.createElement('button');
+            switchToGeminiBtn.innerText = 'Usar a Gemini (Recomendado)';
+            Object.assign(switchToGeminiBtn.style, {
                 background: 'linear-gradient(135deg, #a78bfa 0%, #8b5cf6 100%)',
                 border: 'none', borderRadius: '8px', color: 'white', cursor: 'pointer',
                 fontSize: '14px', fontWeight: '500', padding: '12px',
                 transition: 'all 0.2s ease'
             });
-            btnGemini.onmouseover = () => btnGemini.style.opacity = '0.9';
-            btnGemini.onmouseout = () => btnGemini.style.opacity = '1';
-            btnGemini.onclick = () => {
-                closeModal();
+            switchToGeminiBtn.onmouseover = () => switchToGeminiBtn.style.opacity = '0.9';
+            switchToGeminiBtn.onmouseout = () => switchToGeminiBtn.style.opacity = '1';
+            switchToGeminiBtn.onclick = () => {
+                dismissModal();
                 resolve('gemini');
             };
 
-            const btnNoImage = document.createElement('button');
-            btnNoImage.innerText = 'Responder sem enviar Imagem';
-            Object.assign(btnNoImage.style, {
+            const proceedWithoutImageBtn = document.createElement('button');
+            proceedWithoutImageBtn.innerText = 'Responder sem enviar Imagem';
+            Object.assign(proceedWithoutImageBtn.style, {
                 background: 'rgba(255, 255, 255, 0.1)',
                 border: '1px solid rgba(255, 255, 255, 0.2)',
                 borderRadius: '8px', color: 'rgba(255, 255, 255, 0.8)',
                 cursor: 'pointer', fontSize: '14px', fontWeight: '500',
                 padding: '12px', transition: 'all 0.2s ease'
             });
-            btnNoImage.onmouseover = () => btnNoImage.style.background = 'rgba(255, 255, 255, 0.15)';
-            btnNoImage.onmouseout = () => btnNoImage.style.background = 'rgba(255, 255, 255, 0.1)';
-            btnNoImage.onclick = () => {
-                closeModal();
+            proceedWithoutImageBtn.onmouseover = () => proceedWithoutImageBtn.style.background = 'rgba(255, 255, 255, 0.15)';
+            proceedWithoutImageBtn.onmouseout = () => proceedWithoutImageBtn.style.background = 'rgba(255, 255, 255, 0.1)';
+            proceedWithoutImageBtn.onclick = () => {
+                dismissModal();
                 resolve('sem_imagem');
             };
 
-            overlay.onclick = (e) => {
-                if (e.target === overlay) {
-                    closeModal();
+            overlayNode.onclick = (e) => {
+                if (e.target === overlayNode) {
+                    dismissModal();
                     reject(new Error('Ação cancelada.'));
                 }
             };
 
-            buttonContainer.appendChild(btnGemini);
-            buttonContainer.appendChild(btnNoImage);
-            modalContainer.appendChild(title);
-            modalContainer.appendChild(message);
-            modalContainer.appendChild(buttonContainer);
-            overlay.appendChild(modalContainer);
-            document.body.appendChild(overlay);
+            actionButtonGroup.appendChild(switchToGeminiBtn);
+            actionButtonGroup.appendChild(proceedWithoutImageBtn);
+            modalContentNode.appendChild(modalTitle);
+            modalContentNode.appendChild(modalDescription);
+            modalContentNode.appendChild(actionButtonGroup);
+            overlayNode.appendChild(modalContentNode);
+            document.body.appendChild(overlayNode);
 
-            setTimeout(() => overlay.style.opacity = '1', 10);
+            setTimeout(() => overlayNode.style.opacity = '1', 10);
         });
     }
 
-    /**
-     * Torna o painel flutuante arrastável. (v50)
-     * @param {HTMLElement} panel - O elemento principal do painel.
-     * @param {HTMLElement} handle - O elemento que aciona o arraste (neste caso, o próprio painel).
-     */
-    function makeDraggable(panel, handle) {
-        let offsetX = 0, offsetY = 0, isDragging = false;
+    function enablePanelDragBehavior(panelNode, dragHandleNode) {
+        let dragOffsetX = 0, dragOffsetY = 0, isDragActive = false;
 
-        handle.addEventListener('mousedown', (e) => {
-            // Previne o arraste se o clique foi em um botão ou link
+        dragHandleNode.addEventListener('mousedown', (e) => {
             if (e.target.tagName === 'BUTTON' || e.target.closest('a')) return;
 
-            isDragging = true;
-            const rect = panel.getBoundingClientRect();
+            isDragActive = true;
+            const boundingRect = panelNode.getBoundingClientRect();
 
-            // Converte a posição 'bottom'/'right' para 'top'/'left' na primeira vez
-            if (panel.style.bottom || panel.style.right) {
-                panel.style.right = 'auto';
-                panel.style.bottom = 'auto';
-                panel.style.top = rect.top + 'px';
-                panel.style.left = rect.left + 'px';
+            if (panelNode.style.bottom || panelNode.style.right) {
+                panelNode.style.right = 'auto';
+                panelNode.style.bottom = 'auto';
+                panelNode.style.top = boundingRect.top + 'px';
+                panelNode.style.left = boundingRect.left + 'px';
             }
 
-            offsetX = e.clientX - panel.getBoundingClientRect().left;
-            offsetY = e.clientY - panel.getBoundingClientRect().top;
+            dragOffsetX = e.clientX - panelNode.getBoundingClientRect().left;
+            dragOffsetY = e.clientY - panelNode.getBoundingClientRect().top;
 
-            panel.style.transition = 'none'; // Desabilita transição suave durante o arraste
-            handle.style.cursor = 'grabbing';
+            panelNode.style.transition = 'none';
+            dragHandleNode.style.cursor = 'grabbing';
         });
 
         document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
+            if (!isDragActive) return;
 
-            let newX = e.clientX - offsetX;
-            let newY = e.clientY - offsetY;
+            let nextX = e.clientX - dragOffsetX;
+            let nextY = e.clientY - dragOffsetY;
 
-            // Mantém o painel dentro da tela
-            newX = Math.max(0, Math.min(newX, window.innerWidth - panel.offsetWidth));
-            newY = Math.max(0, Math.min(newY, window.innerHeight - panel.offsetHeight));
+            nextX = Math.max(0, Math.min(nextX, window.innerWidth - panelNode.offsetWidth));
+            nextY = Math.max(0, Math.min(nextY, window.innerHeight - panelNode.offsetHeight));
 
-            panel.style.top = newY + 'px';
-            panel.style.left = newX + 'px';
+            panelNode.style.top = nextY + 'px';
+            panelNode.style.left = nextX + 'px';
         });
 
         document.addEventListener('mouseup', () => {
-            if (!isDragging) return;
-            isDragging = false;
-            panel.style.transition = 'transform 0.3s ease-out, opacity 0.3s ease-out'; // Reabilita
-            handle.style.cursor = 'default';
+            if (!isDragActive) return;
+            isDragActive = false;
+            panelNode.style.transition = 'transform 0.3s ease-out, opacity 0.3s ease-out';
+            dragHandleNode.style.cursor = 'default';
         });
     }
 
-    function criarFloatingPanel() {
+    function mountFloatingControlPanel() {
         if (document.getElementById('scolver-floating-panel')) return;
-        const panel = document.createElement('div');
-        panel.id = 'scolver-floating-panel';
-        Object.assign(panel.style, {
+        const panelNode = document.createElement('div');
+        panelNode.id = 'scolver-floating-panel';
+        Object.assign(panelNode.style, {
             position: 'fixed', bottom: '60px', right: '20px', zIndex: '2147483647',
             display: 'flex', flexDirection: 'column', alignItems: 'stretch',
             gap: '10px', padding: '12px', backgroundColor: 'rgba(26, 27, 30, 0.7)',
@@ -1155,9 +1132,9 @@
             cursor: 'default'
         });
 
-        const responseViewer = document.createElement('div');
-        responseViewer.id = 'ai-response-viewer';
-        Object.assign(responseViewer.style, {
+        const rawResponseViewerNode = document.createElement('div');
+        rawResponseViewerNode.id = 'ai-response-viewer';
+        Object.assign(rawResponseViewerNode.style, {
             display: 'none', position: 'absolute', bottom: 'calc(100% + 10px)', right: '0',
             width: '300px', maxHeight: '200px', overflowY: 'auto',
             background: 'rgba(10, 10, 15, 0.9)', backdropFilter: 'blur(5px)',
@@ -1167,70 +1144,68 @@
             boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4)',
             textAlign: 'left'
         });
-        panel.appendChild(responseViewer);
+        panelNode.appendChild(rawResponseViewerNode);
 
-        const viewResponseBtn = document.createElement('button');
-        viewResponseBtn.id = 'view-raw-response-btn';
-        Object.assign(viewResponseBtn.style, {
+        const rawResponseToggleBtn = document.createElement('button');
+        rawResponseToggleBtn.id = 'view-raw-response-btn';
+        Object.assign(rawResponseToggleBtn.style, {
             background: 'none', border: '1px solid rgba(255, 255, 255, 0.2)',
             color: 'rgba(255, 255, 255, 0.6)', cursor: 'pointer',
             fontSize: '11px', padding: '4px 8px', borderRadius: '6px',
             display: 'none', transition: 'all 0.2s ease',
             marginBottom: '4px'
         });
-        viewResponseBtn.innerText = 'Ver Resposta da IA';
-        viewResponseBtn.addEventListener('click', () => {
-            if (responseViewer.style.display === 'block') {
-                responseViewer.style.display = 'none';
+        rawResponseToggleBtn.innerText = 'Ver Resposta da IA';
+        rawResponseToggleBtn.addEventListener('click', () => {
+            if (rawResponseViewerNode.style.display === 'block') {
+                rawResponseViewerNode.style.display = 'none';
             } else {
-                responseViewer.innerText = lastAiResponse || "Nenhuma resposta da IA foi recebida ainda.";
-                responseViewer.style.display = 'block';
+                rawResponseViewerNode.innerText = rawAiResponseCache || "Nenhuma resposta da IA foi recebida ainda.";
+                rawResponseViewerNode.style.display = 'block';
             }
         });
-        panel.appendChild(viewResponseBtn);
+        panelNode.appendChild(rawResponseToggleBtn);
 
-        // --- Botão Ocultar (v50) ---
-        const toggleBtn = document.createElement('button');
-        toggleBtn.id = 'toggle-ui-btn';
-        toggleBtn.innerText = 'Ocultar';
-        Object.assign(toggleBtn.style, {
+        const panelVisibilityToggleBtn = document.createElement('button');
+        panelVisibilityToggleBtn.id = 'toggle-ui-btn';
+        panelVisibilityToggleBtn.innerText = 'Ocultar';
+        Object.assign(panelVisibilityToggleBtn.style, {
             background: 'none', border: '1px solid rgba(255, 255, 255, 0.2)',
             color: 'rgba(255, 255, 255, 0.6)', cursor: 'pointer',
             fontSize: '11px', padding: '4px 8px', borderRadius: '6px',
             transition: 'all 0.2s ease',
             marginBottom: '4px'
         });
-        panel.appendChild(toggleBtn);
-        // --- Fim do Botão Ocultar ---
+        panelNode.appendChild(panelVisibilityToggleBtn);
 
-        const aiToggleBtn = document.createElement('button');
-        aiToggleBtn.id = 'ai-toggle-btn';
-        aiToggleBtn.innerText = 'IA: Gemini';
-        Object.assign(aiToggleBtn.style, {
+        const providerToggleBtn = document.createElement('button');
+        providerToggleBtn.id = 'ai-toggle-btn';
+        providerToggleBtn.innerText = 'IA: Gemini';
+        Object.assign(providerToggleBtn.style, {
             background: 'none', border: '1px solid rgba(255, 255, 255, 0.2)',
             color: 'rgba(255, 255, 255, 0.6)', cursor: 'pointer',
             fontSize: '11px', padding: '4px 8px', borderRadius: '6px',
             transition: 'all 0.2s ease',
             marginBottom: '4px'
         });
-        aiToggleBtn.addEventListener('click', () => {
-            if (currentAiProvider === 'gemini') {
-                currentAiProvider = 'deepseek';
-                aiToggleBtn.innerText = 'IA: DeepSeek';
-                aiToggleBtn.style.color = '#a78bfa';
+        providerToggleBtn.addEventListener('click', () => {
+            if (activeAiProvider === 'gemini') {
+                activeAiProvider = 'deepseek';
+                providerToggleBtn.innerText = 'IA: DeepSeek';
+                providerToggleBtn.style.color = '#a78bfa';
             } else {
-                currentAiProvider = 'gemini';
-                aiToggleBtn.innerText = 'IA: Gemini';
-                aiToggleBtn.style.color = 'rgba(255, 255, 255, 0.6)';
+                activeAiProvider = 'gemini';
+                providerToggleBtn.innerText = 'IA: Gemini';
+                providerToggleBtn.style.color = 'rgba(255, 255, 255, 0.6)';
             }
-            console.log(`Provedor de IA alterado para: ${currentAiProvider}`);
+            console.log(`Provedor de IA alterado para: ${activeAiProvider}`);
         });
-        panel.appendChild(aiToggleBtn);
+        panelNode.appendChild(providerToggleBtn);
 
-        const button = document.createElement('button');
-        button.id = 'ai-solver-button';
-        button.innerHTML = '✨ Resolver';
-        Object.assign(button.style, {
+        const solverActionBtn = document.createElement('button');
+        solverActionBtn.id = 'ai-solver-button';
+        solverActionBtn.innerHTML = '✨ Resolver';
+        Object.assign(solverActionBtn.style, {
             background: 'linear-gradient(135deg, #a78bfa 0%, #8b5cf6 100%)',
             border: 'none', borderRadius: '10px', color: 'white', cursor: 'pointer',
             fontFamily: 'system-ui, sans-serif', fontSize: '15px', fontWeight: '600',
@@ -1238,178 +1213,170 @@
             transition: 'all 0.2s ease', letterSpacing: '0.5px',
             display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
         });
-        button.addEventListener('mouseover', () => { button.style.transform = 'translateY(-2px)'; button.style.boxShadow = '0 6px 15px rgba(0, 0, 0, 0.3)'; });
-        button.addEventListener('mouseout', () => { button.style.transform = 'translateY(0)'; button.style.boxShadow = '0 4px 10px rgba(0, 0, 0, 0.2)'; });
-        button.addEventListener('mousedown', () => { button.style.transform = 'translateY(1px)'; button.style.boxShadow = '0 2px 5px rgba(0, 0, 0, 0.15)'; });
-        button.addEventListener('mouseup', () => { button.style.transform = 'translateY(-2px)'; button.style.boxShadow = '0 6px 15px rgba(0, 0, 0, 0.3)'; });
-        button.addEventListener('click', resolverQuestao);
-        panel.appendChild(button);
+        solverActionBtn.addEventListener('mouseover', () => { solverActionBtn.style.transform = 'translateY(-2px)'; solverActionBtn.style.boxShadow = '0 6px 15px rgba(0, 0, 0, 0.3)'; });
+        solverActionBtn.addEventListener('mouseout', () => { solverActionBtn.style.transform = 'translateY(0)'; solverActionBtn.style.boxShadow = '0 4px 10px rgba(0, 0, 0, 0.2)'; });
+        solverActionBtn.addEventListener('mousedown', () => { solverActionBtn.style.transform = 'translateY(1px)'; solverActionBtn.style.boxShadow = '0 2px 5px rgba(0, 0, 0, 0.15)'; });
+        solverActionBtn.addEventListener('mouseup', () => { solverActionBtn.style.transform = 'translateY(-2px)'; solverActionBtn.style.boxShadow = '0 6px 15px rgba(0, 0, 0, 0.3)'; });
+        solverActionBtn.addEventListener('click', triggerQuestionSolver);
+        panelNode.appendChild(solverActionBtn);
 
-        const watermark = document.createElement('div');
-        watermark.id = 'scolver-watermark'; // ID para ocultar
-        const githubIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 3c-.58.0-1.25.27-2 1.5c-2.2.86-4.5 1.3-7 1.3-2.5 0-4.7-.44-7-1.3-.75-1.23-1.42-1.5-2-1.5A5.07 5.07 0 0 0 4 4.77 5.44 5.44 0 0 0 2 10.71c0 6.13 3.49 7.34 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>`;
-        const instagramIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg>`;
-        watermark.innerHTML = `
+        const brandingFooterNode = document.createElement('div');
+        brandingFooterNode.id = 'scolver-watermark';
+        const githubSvgIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 3c-.58.0-1.25.27-2 1.5c-2.2.86-4.5 1.3-7 1.3-2.5 0-4.7-.44-7-1.3-.75-1.23-1.42-1.5-2-1.5A5.07 5.07 0 0 0 4 4.77 5.44 5.44 0 0 0 2 10.71c0 6.13 3.49 7.34 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>`;
+        const instagramSvgIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg>`;
+        brandingFooterNode.innerHTML = `
             <div style="display: flex; gap: 8px; align-items: center; color: rgba(255,255,255,0.7); margin-top: 8px; justify-content: flex-end;">
                 <span style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 13px; font-weight: 400;">@scolver</span>
-                <a href="https://github.com/scolver" target="_blank" title="GitHub" style="line-height: 0; color: inherit; transition: color 0.2s ease;">${githubIcon}</a>
-                <a href="httpsa://instagram.com/jairmessiasbolsonaro" target="_blank" title="Instagram" style="line-height: 0; color: inherit; transition: color 0.2s ease;">${instagramIcon}</a>
+                <a href="https://github.com/scolver" target="_blank" title="GitHub" style="line-height: 0; color: inherit; transition: color 0.2s ease;">${githubSvgIcon}</a>
+                <a href="httpsa://instagram.com/jairmessiasbolsonaro" target="_blank" title="Instagram" style="line-height: 0; color: inherit; transition: color 0.2s ease;">${instagramSvgIcon}</a>
             </div>
         `;
-        watermark.querySelectorAll('a').forEach(link => {
-            link.addEventListener('mouseover', () => link.style.color = 'white');
-            link.addEventListener('mouseout', () => link.style.color = 'rgba(255,255,255,0.7)');
+        brandingFooterNode.querySelectorAll('a').forEach(linkNode => {
+            linkNode.addEventListener('mouseover', () => linkNode.style.color = 'white');
+            linkNode.addEventListener('mouseout', () => linkNode.style.color = 'rgba(255,255,255,0.7)');
         });
-        panel.appendChild(watermark);
-        document.body.appendChild(panel);
+        panelNode.appendChild(brandingFooterNode);
+        document.body.appendChild(panelNode);
 
-        // --- LÓGICA DE OCULTAR/MOSTRAR (v50) ---
-        const contentToToggle = [
+        const toggleableElementIds = [
             'view-raw-response-btn',
             'ai-toggle-btn',
             'ai-solver-button',
             'scolver-watermark'
         ];
 
-        toggleBtn.addEventListener('click', (e) => {
-            e.stopPropagation(); // Previne que o clique no botão inicie o arraste
-            const isHidden = toggleBtn.innerText === 'Mostrar';
-            toggleBtn.innerText = isHidden ? 'Ocultar' : 'Mostrar';
+        panelVisibilityToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isPanelCollapsed = panelVisibilityToggleBtn.innerText === 'Mostrar';
+            panelVisibilityToggleBtn.innerText = isPanelCollapsed ? 'Ocultar' : 'Mostrar';
 
-            contentToToggle.forEach(id => {
-                const el = document.getElementById(id);
-                if (el) {
-                    el.style.display = isHidden ? '' : 'none';
+            toggleableElementIds.forEach(elementId => {
+                const targetNode = document.getElementById(elementId);
+                if (targetNode) {
+                    targetNode.style.display = isPanelCollapsed ? '' : 'none';
                 }
             });
 
-            // Re-aplica 'display: none' ao viewResponseBtn se ele já estava oculto
-            if (isHidden && !lastAiResponse) {
-                 document.getElementById('view-raw-response-btn').style.display = 'none';
+            if (isPanelCollapsed && !rawAiResponseCache) {
+                document.getElementById('view-raw-response-btn').style.display = 'none';
             }
         });
 
-        // --- LÓGICA DE ARRASTAR (v50) ---
-        // A alça é o painel inteiro
-        makeDraggable(panel, panel);
+        enablePanelDragBehavior(panelNode, panelNode);
 
         setTimeout(() => {
-            panel.style.transform = 'translateY(0)';
-            panel.style.opacity = '1';
+            panelNode.style.transform = 'translateY(0)';
+            panelNode.style.opacity = '1';
         }, 100);
         console.log("Floating Panel do resolvedor v52.1 criado com sucesso!");
     }
 
-    // --- LÓGICA DE DETECÇÃO DE QUIZ ID (v46) ---
 
-    function logQuizId(id, source) {
-        if (id === quizIdDetected) {
+    function registerQuizId(id, detectionSource) {
+        if (id === detectedQuizId) {
             return;
         }
-        quizIdDetected = id;
-        console.log(`[Quizizz Bypass] Novo Quiz ID detectado (${source}): %c${id}`, "color: #00FF00; font-weight: bold;");
+        detectedQuizId = id;
+        console.log(`[Quizizz Bypass] Novo Quiz ID detectado (${detectionSource}): %c${id}`, "color: #00FF00; font-weight: bold;");
     }
 
-    function detectQuizIdFromURL() {
-        const match = window.location.pathname.match(regexQuizId);
-        return match ? match[1] : null;
+    function extractQuizIdFromCurrentUrl() {
+        const urlMatch = window.location.pathname.match(QUIZ_ID_URL_PATTERN);
+        return urlMatch ? urlMatch[1] : null;
     }
 
-    function interceptFetch() {
-        const originalFetch = window.fetch;
+    function patchFetchForQuizIdCapture() {
+        const nativeFetch = window.fetch;
         window.fetch = async function (...args) {
-            const [resource] = args;
-            if (typeof resource === 'string') {
-                const match = resource.match(regexQuizId);
-                if (match) {
-                    const id = match[1];
-                    logQuizId(id, "fetch");
+            const [requestResource] = args;
+            if (typeof requestResource === 'string') {
+                const urlMatch = requestResource.match(QUIZ_ID_URL_PATTERN);
+                if (urlMatch) {
+                    const capturedId = urlMatch[1];
+                    registerQuizId(capturedId, "fetch");
                 }
             }
-            return originalFetch.apply(this, args);
+            return nativeFetch.apply(this, args);
         };
     }
 
-    function interceptXHR() {
-        const originalOpen = XMLHttpRequest.prototype.open;
+    function patchXhrForQuizIdCapture() {
+        const nativeXhrOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function (method, url) {
             if (typeof url === 'string') {
-                const match = url.match(regexQuizId);
-                if (match) {
-                    const id = match[1];
-                    logQuizId(id, "XHR");
+                const urlMatch = url.match(QUIZ_ID_URL_PATTERN);
+                if (urlMatch) {
+                    const capturedId = urlMatch[1];
+                    registerQuizId(capturedId, "XHR");
                 }
             }
-            return originalOpen.apply(this, arguments);
+            return nativeXhrOpen.apply(this, arguments);
         };
     }
 
-    function initQuizIdDetector() {
+    function bootstrapQuizIdDetector() {
         console.log("[Quizizz Bypass] Detector de Quiz ID carregado.");
-        const id = detectQuizIdFromURL();
-        if (id) {
-            logQuizId(id, "URL");
+        const detectedFromUrl = extractQuizIdFromCurrentUrl();
+        if (detectedFromUrl) {
+            registerQuizId(detectedFromUrl, "URL");
         }
 
-        if (!interceptorsStarted) {
+        if (!networkInterceptorsActive) {
             console.log("[Quizizz Bypass] Iniciando interceptadores de rede (fetch/XHR).");
-            interceptFetch();
-            interceptXHR();
-            interceptorsStarted = true;
+            patchFetchForQuizIdCapture();
+            patchXhrForQuizIdCapture();
+            networkInterceptorsActive = true;
         }
     }
 
-    (function monitorSPA() {
-        const pushState = history.pushState;
+    (function monitorSpaNavigation() {
+        const nativePushState = history.pushState;
         history.pushState = function () {
-            const result = pushState.apply(this, arguments);
-            setTimeout(initQuizIdDetector, 300);
-            return result;
+            const navigationResult = nativePushState.apply(this, arguments);
+            setTimeout(bootstrapQuizIdDetector, 300);
+            return navigationResult;
         };
-        window.addEventListener("popstate", () => setTimeout(initQuizIdDetector, 300));
+        window.addEventListener("popstate", () => setTimeout(bootstrapQuizIdDetector, 300));
     })();
 
-    // --- FIM DA LÓGICA DE DETECÇÃO DE QUIZ ID ---
 
-
-    async function fetchWithTimeout(resource, options = {}, timeout = 15000) {
-        const controller = new AbortController();
-        const id = setTimeout(() => controller.abort(), timeout);
+    async function fetchWithTimeout(resourceUrl, fetchOptions = {}, timeoutMs = 15000) {
+        const abortController = new AbortController();
+        const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
         try {
-            const response = await fetch(resource, { ...options, signal: controller.signal });
-            clearTimeout(id);
-            return response;
-        } catch (error) {
-            clearTimeout(id);
-            if (error.name === 'AbortError') throw new Error('A requisição demorou muito e foi cancelada (Timeout).');
-            throw error;
+            const fetchResponse = await fetch(resourceUrl, { ...fetchOptions, signal: abortController.signal });
+            clearTimeout(timeoutHandle);
+            return fetchResponse;
+        } catch (fetchError) {
+            clearTimeout(timeoutHandle);
+            if (fetchError.name === 'AbortError') throw new Error('A requisição demorou muito e foi cancelada (Timeout).');
+            throw fetchError;
         }
     }
 
-    async function imageUrlToBase64(url) {
+    async function imageUrlToBase64(imageUrl) {
         try {
-            const cacheBustUrl = new URL(url);
-            cacheBustUrl.searchParams.set('_t', new Date().getTime());
+            const cacheBustedUrl = new URL(imageUrl);
+            cacheBustedUrl.searchParams.set('_t', new Date().getTime());
 
-            const r = await fetchWithTimeout(cacheBustUrl.href, { cache: 'no-store' });
-            const b = await r.blob();
-            return new Promise((res, rej) => {
-                const reader = new FileReader();
-                reader.onloadend = () => res(reader.result);
-                reader.onerror = (e) => {
-                    console.error("Erro no FileReader:", e);
-                    rej(e);
+            const fetchResponse = await fetchWithTimeout(cacheBustedUrl.href, { cache: 'no-store' });
+            const imageBlob = await fetchResponse.blob();
+            return new Promise((resolve, reject) => {
+                const fileReader = new FileReader();
+                fileReader.onloadend = () => resolve(fileReader.result);
+                fileReader.onerror = (readerError) => {
+                    console.error("Erro no FileReader:", readerError);
+                    reject(readerError);
                 };
-                reader.readAsDataURL(b);
+                fileReader.readAsDataURL(imageBlob);
             });
-        } catch (e) {
-            console.error(`Erro ao converter imagem: ${e.message}`, url);
+        } catch (conversionError) {
+            console.error(`Erro ao converter imagem: ${conversionError.message}`, imageUrl);
             return null;
         }
     }
 
-    // --- Start ---
-    setTimeout(criarFloatingPanel, 2000); // Inicia a UI
-    initQuizIdDetector(); // Inicia o detector de ID
+    setTimeout(mountFloatingControlPanel, 2000);
+    bootstrapQuizIdDetector();
 
 })();
